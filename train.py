@@ -8,10 +8,12 @@ import glob
 # Parse GPU selection before importing torch
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu_num', default="0", type=str, help='GPU device number')
-parser.add_argument('--obs_len', type=int, default=10)
-parser.add_argument('--pred_len', type=int, default=10)
-parser.add_argument('--dataset', default='eth',
-                    help='eth,hotel,univ,zara1,zara2')
+parser.add_argument('--obs_len', type=int, default=5,
+                    help='Observation sequence length (5 min, aligned with Sekhon & Fleming 2020)')
+parser.add_argument('--pred_len', type=int, default=5,
+                    help='Prediction sequence length (5 min, aligned with Sekhon & Fleming 2020)')
+parser.add_argument('--dataset', default='noaa_jan2017',
+                    help='Dataset name (folder under ./dataset/)')
 parser.add_argument('--batch_size', type=int, default=32,
                     help='minibatch size (used for gradient accumulation)')
 parser.add_argument('--num_epochs', type=int, default=200,
@@ -24,7 +26,8 @@ parser.add_argument('--milestones', type=int, default=[0, 100],
                     help='number of steps to drop the lr')
 parser.add_argument('--use_lrschd', action="store_true", default=False,
                     help='Use lr rate scheduler')
-parser.add_argument('--tag', default='AddGCN_10_10', help='personal tag for the model')
+parser.add_argument('--tag', default='SMCHN_5_5',
+                    help='personal tag for the model')
 
 # Parse early to set CUDA device before importing torch
 args_early, _ = parser.parse_known_args()
@@ -87,12 +90,12 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
     global metrics, constant_metrics
     model.train()
 
-    loss_batch = 0
+    loss_batch  = 0
     batch_count = 0
     is_fst_loss = True
-    loader_len = len(loader_train)
-    turn_point = int(loader_len / args.batch_size) * args.batch_size + \
-                 loader_len % args.batch_size - 1
+    loader_len  = len(loader_train)
+    turn_point  = int(loader_len / args.batch_size) * args.batch_size + \
+                  loader_len % args.batch_size - 1
 
     for cnt, batch in enumerate(loader_train):
         batch_count += 1
@@ -107,11 +110,9 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         V_pred = model(V_obs, identity)
         V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
 
-        # Target: V_tr contains velocities — matches original repo
-        # V_tr shape: [1, pred_len, N, 4] → squeeze → [pred_len, N, 4]
         V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
 
-        # Gradient accumulation (original repo style)
+        # Gradient accumulation
         if batch_count % args.batch_size != 0 and cnt != turn_point:
             l = graph_loss(V_pred, V_target)
             if is_fst_loss:
@@ -150,12 +151,12 @@ def vald(epoch, model, checkpoint_dir, loader_val):
     global metrics, constant_metrics
     model.eval()
 
-    loss_batch = 0
+    loss_batch  = 0
     batch_count = 0
     is_fst_loss = True
-    loader_len = len(loader_val)
-    turn_point = int(loader_len / args.batch_size) * args.batch_size + \
-                 loader_len % args.batch_size - 1
+    loader_len  = len(loader_val)
+    turn_point  = int(loader_len / args.batch_size) * args.batch_size + \
+                  loader_len % args.batch_size - 1
 
     for cnt, batch in enumerate(loader_val):
         batch_count += 1
@@ -171,8 +172,6 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             V_pred = model(V_obs, identity)
             V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
 
-            # Target: V_tr contains velocities — matches original repo
-            # V_tr shape: [1, pred_len, N, 4] → squeeze → [pred_len, N, 4]
             V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
 
             if batch_count % args.batch_size != 0 and cnt != turn_point:
@@ -199,7 +198,7 @@ def vald(epoch, model, checkpoint_dir, loader_val):
 
 
 def main(args):
-    obs_seq_len = args.obs_len
+    obs_seq_len  = args.obs_len
     pred_seq_len = args.pred_len
 
     data_set = './dataset/' + args.dataset + '/'
@@ -213,7 +212,7 @@ def main(args):
     if not train_csv_files:
         raise RuntimeError(
             f"Dataset split 'train' has no CSV files in {train_dir}. "
-            f"Run preprocessing first (python preprocess_ais.py)."
+            f"Run preprocessing first: python preprocess_ais.py"
         )
 
     val_dir, val_csv_files = _get_split_csv_files('val')
@@ -248,6 +247,8 @@ def main(args):
 
     print('Training started ...')
     print(f'Using device: {device}')
+    print(f'Dataset: {args.dataset}')
+    print(f'obs_len={obs_seq_len} min, pred_len={pred_seq_len} min (Sekhon & Fleming 2020 aligned)')
 
     writer = SummaryWriter(f"runs/{args.tag}_{args.dataset}_{time.strftime('%Y%m%d-%H%M%S')}")
 
@@ -283,7 +284,7 @@ def main(args):
         vald(epoch, model, checkpoint_dir, loader_val)
 
         writer.add_scalar('trainloss', np.array(metrics['train_loss'])[epoch], epoch)
-        writer.add_scalar('valloss', np.array(metrics['val_loss'])[epoch], epoch)
+        writer.add_scalar('valloss',   np.array(metrics['val_loss'])[epoch],   epoch)
 
         if args.use_lrschd:
             scheduler.step()
@@ -293,7 +294,6 @@ def main(args):
         for k, v in metrics.items():
             if len(v) > 0:
                 print(k, v[-1])
-
         print(constant_metrics)
         print('*' * 30)
 

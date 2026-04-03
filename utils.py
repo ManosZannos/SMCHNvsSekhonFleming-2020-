@@ -8,6 +8,8 @@ Includes:
 2) TrajectoryDataset: trajectory-wise sliding window (paper-aligned).
    Each window is anchored to a single vessel's continuous trajectory segment.
    Interaction graph at each timestep includes ALL vessels present in those frames.
+
+NOTE: Status column removed — not present in 2017 NOAA AIS data.
 """
 
 import os
@@ -27,7 +29,8 @@ from tqdm import tqdm
 # Output: frame_id, vessel_id, LON, LAT, SOG, Heading
 # ============================================================================
 
-NOAA_REQUIRED_COLS = ["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "Heading", "Status"]
+# Status removed: not available in 2017 NOAA AIS dataset
+NOAA_REQUIRED_COLS = ["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "Heading"]
 
 
 def _valid_mmsi_9digits(series: pd.Series) -> pd.Series:
@@ -63,7 +66,10 @@ def clean_abnormal_data_noaa(
     - 9-digit MMSI validation
     - Drop nulls in key fields
     - Filter by geographic/dynamic ranges (LAT, LON, SOG, Heading)
+
+    NOTE: Status column excluded — not present in 2017 NOAA AIS data.
     """
+    # Check only required columns (no Status)
     missing = [c for c in NOAA_REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
@@ -74,7 +80,9 @@ def clean_abnormal_data_noaa(
 
     df = df.copy()
     df["BaseDateTime"] = pd.to_datetime(df["BaseDateTime"], errors="coerce", utc=True)
-    df = df.dropna(subset=["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "Heading", "Status"])
+
+    # Drop nulls — Status excluded
+    df = df.dropna(subset=["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "Heading"])
     print(f"  After removing nulls: {len(df):,} rows")
 
     before = len(df)
@@ -113,16 +121,7 @@ def resample_interpolate_1min(
     interpolated. Large gaps (e.g. vessel left area for hours) are NOT bridged
     with fake linear stretches.
 
-    Example without fix:
-      10:00, 10:03, 15:40  →  340 artificial points across a 5.5-hour gap
-
-    Example with fix (max_gap_minutes=10):
-      Segment 1: 10:00, 10:01, 10:02, 10:03  (3 real + 1 interpolated point)
-      Segment 2: 15:40                         (1 point, too short for windows)
-
-    Each segment is resampled independently. The MMSI column is preserved so
-    the downstream filter_timestamps_min_vessels() and TrajectoryDataset work
-    correctly.
+    NOTE: Status column excluded — not present in 2017 NOAA AIS data.
     """
     initial_count = len(df)
     print(f"\n[Step 2/5] Data interpolation and resampling (max_gap={max_gap_minutes}min)...")
@@ -144,20 +143,15 @@ def resample_interpolate_1min(
         if len(g) == 0:
             continue
 
-        # ----------------------------------------------------------------
         # Split into continuous segments at large gaps
-        # ----------------------------------------------------------------
         time_diffs = g.index.to_series().diff()
-        # First row has NaT diff → treat as start of first segment
         gap_mask = time_diffs > max_gap
-        segment_ids = gap_mask.cumsum()  # 0, 0, 0, 1, 1, 2, ...
+        segment_ids = gap_mask.cumsum()
 
         for _, seg in g.groupby(segment_ids):
             if len(seg) < 2:
-                # Single isolated point — cannot interpolate or form windows
                 continue
 
-            # Resample only within this segment's time range
             time_range = pd.date_range(
                 start=seg.index.min(),
                 end=seg.index.max(),
@@ -170,7 +164,7 @@ def resample_interpolate_1min(
             r["LON"] = r["LON"].interpolate(method="time")
             r["LAT"] = r["LAT"].interpolate(method="time")
 
-            # SOG/Heading: rolling average (paper: "average value is used")
+            # SOG/Heading: rolling average
             for c in ["SOG", "Heading"]:
                 s = r[c]
                 s = s.fillna(
@@ -178,7 +172,7 @@ def resample_interpolate_1min(
                 )
                 r[c] = s.ffill().bfill()
 
-            r["Status"] = r["Status"].ffill().bfill()
+            # Status excluded — not present in 2017 data
             r = r.dropna(subset=["LON", "LAT", "SOG", "Heading"])
 
             if len(r) == 0:
@@ -249,16 +243,11 @@ def to_frame_format(df: pd.DataFrame) -> pd.DataFrame:
     Paper Step 5: Convert to frame format.
 
     Output columns: frame_id, vessel_id, LON, LAT, SOG, Heading
-
-    frame_id is a global minute index from the day's minimum timestamp.
-    This is used by TrajectoryDataset to:
-      1. Find all vessels present at a given frame (for interaction graph)
-      2. Slide windows per vessel trajectory (paper-faithful)
     """
     print(f"\n[Step 5/5] Converting to frame format...")
 
     df = df.copy().sort_values("BaseDateTime")
-    t0 = df["BaseDateTime"].min()
+    t0    = df["BaseDateTime"].min()
     t_end = df["BaseDateTime"].max()
 
     df["frame_id"] = ((df["BaseDateTime"] - t0).dt.total_seconds() / 60.0).round().astype(int)
@@ -288,11 +277,6 @@ def preprocess_noaa_to_frames(
     """
     Complete AIS preprocessing pipeline (paper-aligned).
     Steps 1-5 as described in the paper.
-
-    Args:
-        max_gap_minutes: gaps larger than this break a vessel trajectory into
-                         separate segments before resampling (default: 10 min).
-                         Prevents fake linear interpolation across hour-long gaps.
     """
     print("=" * 70)
     print("AIS DATA PREPROCESSING PIPELINE (Paper-Aligned)")
@@ -344,10 +328,10 @@ def loc_pos(seq_):
     Input:  seq_ shape (seq_len, N, F)
     Output: shape (seq_len, N, F+1)
     """
-    seq_len = seq_.shape[0]
+    seq_len   = seq_.shape[0]
     num_nodes = seq_.shape[1]
-    pos_seq = np.arange(1, seq_len + 1)[:, np.newaxis, np.newaxis]
-    pos_seq = pos_seq.repeat(num_nodes, axis=1)
+    pos_seq   = np.arange(1, seq_len + 1)[:, np.newaxis, np.newaxis]
+    pos_seq   = pos_seq.repeat(num_nodes, axis=1)
     return np.concatenate((pos_seq, seq_), axis=-1)
 
 
@@ -363,7 +347,7 @@ def seq_to_graph(seq_, seq_rel, pos_enc=False):
         → output shape: (seq_len, N, 4) with [LON_rel, LAT_rel, SOG_rel, Heading_rel]
 
     Args:
-        seq_:    (N, 4, seq_len) — absolute positions (used only for shape reference)
+        seq_:    (N, 4, seq_len) — absolute positions
         seq_rel: (N, 4, seq_len) — velocities (differences between consecutive steps)
         pos_enc: if True, prepend positional index [1, 2, ..., seq_len]
 
@@ -372,13 +356,9 @@ def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
     assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
 
-    # Use all 4 features: LON_rel, LAT_rel, SOG_rel, Heading_rel
-    # seq_rel shape: (N, 4, seq_len) → permute → (seq_len, N, 4)
     V = seq_rel.permute(2, 0, 1).contiguous()  # (seq_len, N, 4)
 
     if pos_enc:
-        # Add positional index as first feature → (seq_len, N, 5)
-        # [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
         V_np = V.cpu().numpy()
         V_np = loc_pos(V_np)  # (seq_len, N, 5)
         return torch.from_numpy(V_np).float()
@@ -392,7 +372,7 @@ def poly_fit(traj, traj_len, threshold):
     Input: traj shape (C, traj_len), uses only first 2 channels (LON, LAT).
     """
     traj2 = traj[:2, :]
-    t = np.linspace(0, traj_len - 1, traj_len)
+    t     = np.linspace(0, traj_len - 1, traj_len)
     res_x = np.polyfit(t, traj2[0, -traj_len:], 2, full=True)[1]
     res_y = np.polyfit(t, traj2[1, -traj_len:], 2, full=True)[1]
     return 1.0 if (res_x + res_y >= threshold) else 0.0
@@ -415,16 +395,13 @@ class TrajectoryDataset(Dataset):
       2. Slide a window of seq_len frames over the day
       3. For each window, keep only vessels present in ALL seq_len frames
       4. Require at least min_ped vessels per window
-
-    This is fast (vectorized numpy) and matches the paper's scene-level graph:
-    all co-present vessels form the spatial graph at each timestep.
     """
 
     def __init__(
         self,
         data_dir,
-        obs_len=10,
-        pred_len=10,
+        obs_len=5,
+        pred_len=5,
         skip=1,
         threshold=0.002,
         min_ped=1,
@@ -432,10 +409,10 @@ class TrajectoryDataset(Dataset):
     ):
         super(TrajectoryDataset, self).__init__()
 
-        self.obs_len = obs_len
+        self.obs_len  = obs_len
         self.pred_len = pred_len
-        self.seq_len = obs_len + pred_len
-        self.skip = skip
+        self.seq_len  = obs_len + pred_len
+        self.skip     = skip
         self.max_peds_in_frame = 0
 
         all_files = sorted([
@@ -446,25 +423,20 @@ class TrajectoryDataset(Dataset):
         if not all_files:
             raise ValueError(f"No CSV files found in {data_dir}")
 
-        num_peds_in_seq = []
-        seq_list = []
-        seq_list_rel = []
-        loss_mask_list = []
+        num_peds_in_seq    = []
+        seq_list           = []
+        seq_list_rel       = []
+        loss_mask_list     = []
         non_linear_ped_list = []
 
         for path in all_files:
-            # Load CSV: frame_id, vessel_id, LON, LAT, SOG, Heading
-            data = pd.read_csv(path)
+            data    = pd.read_csv(path)
             data_np = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].values.astype(np.float32)
 
-            frames = np.unique(data_np[:, 0]).tolist()
-            n_frames = len(frames)
-
-            # Build frame_id → index map and frame_data list
+            frames      = np.unique(data_np[:, 0]).tolist()
+            n_frames    = len(frames)
             frame_to_idx = {frame: i for i, frame in enumerate(frames)}
-            frame_data = []
-            for frame in frames:
-                frame_data.append(data_np[data_np[:, 0] == frame])
+            frame_data  = [data_np[data_np[:, 0] == frame] for frame in frames]
 
             vessel_ids_in_file = np.unique(data_np[:, 1])
             print(f"  {os.path.basename(path)}: {len(vessel_ids_in_file)} vessels, {n_frames} frames")
@@ -475,19 +447,16 @@ class TrajectoryDataset(Dataset):
                 if idx + self.seq_len > n_frames:
                     break
 
-                # All rows in this window
-                curr_seq_data = np.concatenate(frame_data[idx: idx + self.seq_len], axis=0)
-
-                # Vessels that appear in this window
+                curr_seq_data    = np.concatenate(frame_data[idx: idx + self.seq_len], axis=0)
                 peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
                 self.max_peds_in_frame = max(self.max_peds_in_frame, len(peds_in_curr_seq))
 
-                curr_seq     = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
-                curr_seq_rel = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
-                curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len), dtype=np.float32)
+                curr_seq       = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
+                curr_seq_rel   = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
+                curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len),    dtype=np.float32)
 
                 num_peds_considered = 0
-                _non_linear_ped = []
+                _non_linear_ped     = []
 
                 for ped_id in peds_in_curr_seq:
                     curr_ped_seq = curr_seq_data[curr_seq_data[:, 1] == ped_id]
@@ -496,13 +465,12 @@ class TrajectoryDataset(Dataset):
                     pad_front = frame_to_idx[curr_ped_seq[0, 0]] - idx
                     pad_end   = frame_to_idx[curr_ped_seq[-1, 0]] - idx + 1
 
-                    # Vessel must be present in ALL frames of the window
                     if pad_end - pad_front != self.seq_len:
                         continue
                     if curr_ped_seq.shape[0] != self.seq_len:
                         continue
 
-                    feat_seq = np.transpose(curr_ped_seq[:, 2:]).astype(np.float32)  # (4, seq_len)
+                    feat_seq     = np.transpose(curr_ped_seq[:, 2:]).astype(np.float32)  # (4, seq_len)
                     rel_feat_seq = np.zeros_like(feat_seq)
                     rel_feat_seq[:, 1:] = feat_seq[:, 1:] - feat_seq[:, :-1]
 
@@ -530,19 +498,19 @@ class TrajectoryDataset(Dataset):
         print(f"\nTotal sequences: {len(seq_list)}")
         self.num_seq = len(seq_list)
 
-        seq_arr         = np.concatenate(seq_list, axis=0)
-        seq_rel_arr     = np.concatenate(seq_list_rel, axis=0)
-        loss_mask_arr   = np.concatenate(loss_mask_list, axis=0)
-        non_linear_arr  = np.asarray(non_linear_ped_list, dtype=np.float32)
+        seq_arr        = np.concatenate(seq_list,       axis=0)
+        seq_rel_arr    = np.concatenate(seq_list_rel,   axis=0)
+        loss_mask_arr  = np.concatenate(loss_mask_list, axis=0)
+        non_linear_arr = np.asarray(non_linear_ped_list, dtype=np.float32)
 
-        self.obs_traj     = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
-        self.pred_traj    = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
-        self.obs_traj_rel = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
-        self.pred_traj_rel= torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
-        self.loss_mask    = torch.from_numpy(loss_mask_arr).float()
+        self.obs_traj      = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
+        self.pred_traj     = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
+        self.obs_traj_rel  = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
+        self.pred_traj_rel = torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
+        self.loss_mask     = torch.from_numpy(loss_mask_arr).float()
         self.non_linear_ped = torch.from_numpy(non_linear_arr).float()
 
-        cum_start_idx = [0] + np.cumsum(num_peds_in_seq).tolist()
+        cum_start_idx      = [0] + np.cumsum(num_peds_in_seq).tolist()
         self.seq_start_end = [(s, e) for s, e in zip(cum_start_idx, cum_start_idx[1:])]
 
         self.v_obs  = []
@@ -553,11 +521,8 @@ class TrajectoryDataset(Dataset):
         for ss in range(len(self.seq_start_end)):
             pbar.update(1)
             start, end = self.seq_start_end[ss]
-            # V_obs: velocities + positional encoding → (obs_len, N, 4)
-            # matches original repo: seq_to_graph(..., pos_enc=True)
-            v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], True)
+            v_ = seq_to_graph(self.obs_traj[start:end, :],  self.obs_traj_rel[start:end, :],  True)
             self.v_obs.append(v_.clone())
-            # V_pred: absolute positions → (pred_len, N, 4) used as loss target
             v_ = seq_to_graph(self.pred_traj[start:end, :], self.pred_traj_rel[start:end, :], False)
             self.v_pred.append(v_.clone())
         pbar.close()

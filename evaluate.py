@@ -1,21 +1,20 @@
 """
-Evaluation Script with Best-of-K Sampling (Paper-Aligned)
+Evaluation Script - Deterministic ADE/FDE (aligned with Sekhon & Fleming 2020)
 
-Paper quote:
-"During the inference stage, 20 samples are extracted from the learned 
-bivariate Gaussian distribution and the closest sample to the ground-truth 
-is used to calculate the performance index of the model."
+Uses only the mean (μx, μy) of the predicted Gaussian distribution as the
+deterministic prediction — no sampling. This allows direct comparison with
+Sekhon & Fleming 2020 which uses deterministic predictions.
 
-This script implements proper paper-aligned evaluation:
-- K=20 samples from predicted Gaussian distribution
-- Selection of closest sample to ground truth (by minADE)
-- Denormalization to real-world coordinates (degrees)
-- Computation of minADE-20 and FDE (of best sample) in degrees
+Metrics reported in:
+  - Degrees (°)         — SMCHN paper units
+  - Nautical miles (nm) — Sekhon & Fleming 2020 units (for direct comparison)
 
-Expected metrics: 0.001-0.003° (as reported in paper)
+Conversion: 1° ≈ 60 nautical miles
 
 Usage:
-  python evaluate.py --dataset noaa_dec2021 --checkpoint checkpoints/AddGCN_10_10/noaa_dec2021/val_best.pth --split test --num_samples 20
+  python evaluate.py --dataset noaa_jan2017 \
+                     --checkpoint checkpoints/SMCHN_5_5/noaa_jan2017/val_best.pth \
+                     --split test
 """
 
 import argparse
@@ -28,300 +27,252 @@ from tqdm import tqdm
 
 from model import TrajectoryModel
 from utils import TrajectoryDataset
-from metrics import evaluate_best_of_k
+
+# 1 degree ≈ 60 nautical miles
+NM_PER_DEG = 60.0
 
 
 def setup_args():
     parser = argparse.ArgumentParser(description='Trajectory Prediction Evaluation')
-    
-    # Dataset parameters
-    parser.add_argument('--dataset', type=str, default='noaa_dec2021',
+
+    parser.add_argument('--dataset', type=str, default='noaa_jan2017',
                         help='Dataset name (folder under ./dataset/)')
-    parser.add_argument('--split', type=str, default='val',
+    parser.add_argument('--split', type=str, default='test',
                         choices=['train', 'val', 'test'],
                         help='Which split to evaluate on')
-    
-    # Model parameters
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint (.pth file)')
-    parser.add_argument('--obs_len', type=int, default=10,
-                        help='Observation sequence length')
-    parser.add_argument('--pred_len', type=int, default=10,
-                        help='Prediction sequence length')
-    
-    # Evaluation parameters
-    parser.add_argument('--num_samples', type=int, default=20,
-                        help='Number of samples for best-of-K evaluation (K=20 in paper)')
-    parser.add_argument('--batch_size', type=int, default=1,
-                        help='Batch size (keep 1 for compatibility)')
+    parser.add_argument('--obs_len', type=int, default=5,
+                        help='Observation sequence length (5 min, S&F aligned)')
+    parser.add_argument('--pred_len', type=int, default=5,
+                        help='Prediction sequence length (5 min, S&F aligned)')
+    parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--device', type=str, default='cuda',
-                        choices=['cuda', 'cpu'],
-                        help='Device to use')
-    
-    # Model architecture (must match training)
-    parser.add_argument('--num_gcn_layers', type=int, default=1,
-                        help='Number of GCN layers')
-    parser.add_argument('--embedding_dims', type=int, default=64,
-                        help='Embedding dimensions')
-    parser.add_argument('--num_heads', type=int, default=4,
-                        help='Number of attention heads')
-    
+                        choices=['cuda', 'cpu'])
+    parser.add_argument('--num_gcn_layers', type=int, default=1)
+    parser.add_argument('--embedding_dims', type=int, default=64)
+    parser.add_argument('--num_heads', type=int, default=4)
+
     return parser.parse_args()
 
 
 def denormalize_predictions(V_pred, global_stats):
     """
-    Denormalize Gaussian parameters from z-score to real-world coordinates.
-    
-    For Gaussian distribution, when denormalizing x = x_norm * std + mean:
-    - μ_denorm = μ_norm * std + mean
-    - σ_denorm = σ_norm * std
-    
-    Since the model outputs log(σ), we need:
-    - log(σ_denorm) = log(σ_norm * std) = log(σ_norm) + log(std)
-    
-    Args:
-        V_pred: [pred_len, N, 5] - Gaussian parameters (μx, μy, log(σx), log(σy), ρ)
-        global_stats: dict with 'LON' and 'LAT' statistics
-    
-    Returns:
-        V_pred_denorm: [pred_len, N, 5] - with denormalized μx, μy, log(σx), log(σy)
+    Denormalize μx (LON) and μy (LAT) from z-score to real-world coordinates.
     """
     V_pred_denorm = V_pred.clone()
-    
-    # Get statistics
+
     lon_mean = global_stats['LON']['mean']
-    lon_std = global_stats['LON']['std']
+    lon_std  = global_stats['LON']['std']
     lat_mean = global_stats['LAT']['mean']
-    lat_std = global_stats['LAT']['std']
-    
-    # Get device from V_pred to avoid CPU/GPU mismatch
-    device = V_pred.device
-    
-    # Denormalize μx (LON): μ_denorm = μ_norm * std + mean
-    V_pred_denorm[:, :, 0] = V_pred[:, :, 0] * lon_std + lon_mean
-    
-    # Denormalize μy (LAT): μ_denorm = μ_norm * std + mean
-    V_pred_denorm[:, :, 1] = V_pred[:, :, 1] * lat_std + lat_mean
-    
-    # Denormalize log(σx): log(σ_denorm) = log(σ_norm) + log(std)
-    V_pred_denorm[:, :, 2] = V_pred[:, :, 2] + torch.log(torch.tensor(lon_std, device=device))
-    
-    # Denormalize log(σy): log(σ_denorm) = log(σ_norm) + log(std)
-    V_pred_denorm[:, :, 3] = V_pred[:, :, 3] + torch.log(torch.tensor(lat_std, device=device))
-    
-    # ρ (correlation) is scale-invariant, remains unchanged
-    # V_pred_denorm[:, :, 4] stays the same
-    
+    lat_std  = global_stats['LAT']['std']
+
+    V_pred_denorm[:, :, 0] = V_pred[:, :, 0] * lon_std + lon_mean  # μx (LON)
+    V_pred_denorm[:, :, 1] = V_pred[:, :, 1] * lat_std + lat_mean  # μy (LAT)
+
     return V_pred_denorm
 
 
 def denormalize_coordinates(V_target, global_stats):
     """
-    Denormalize ground truth coordinates from z-score to real-world (degrees).
-    
-    Args:
-        V_target: [pred_len, N, 2] - (LON, LAT) in normalized space
-        global_stats: dict with 'LON' and 'LAT' statistics
-    
-    Returns:
-        V_target_denorm: [pred_len, N, 2] - (LON, LAT) in degrees
+    Denormalize ground truth from z-score to real-world coordinates (degrees).
     """
     V_target_denorm = V_target.clone()
-    
-    # Denormalize LON
-    lon_mean = global_stats['LON']['mean']
-    lon_std = global_stats['LON']['std']
-    V_target_denorm[:, :, 0] = V_target[:, :, 0] * lon_std + lon_mean
-    
-    # Denormalize LAT
-    lat_mean = global_stats['LAT']['mean']
-    lat_std = global_stats['LAT']['std']
-    V_target_denorm[:, :, 1] = V_target[:, :, 1] * lat_std + lat_mean
-    
+
+    V_target_denorm[:, :, 0] = (V_target[:, :, 0] * global_stats['LON']['std']
+                                 + global_stats['LON']['mean'])
+    V_target_denorm[:, :, 1] = (V_target[:, :, 1] * global_stats['LAT']['std']
+                                 + global_stats['LAT']['mean'])
+
     return V_target_denorm
 
 
-def evaluate_model(model, loader, device, global_stats, num_samples=20):
+def evaluate_model(model, loader, device, global_stats):
     """
-    Evaluate model with best-of-K sampling in real-world coordinates (degrees).
-    
-    Args:
-        global_stats: dict with normalization statistics from global_stats.json
-    
-    Returns:
-        dict with average minADE and FDE in degrees (paper-aligned)
+    Deterministic evaluation using only the mean (μx, μy) of the Gaussian.
+
+    Aligned with Sekhon & Fleming 2020:
+    - ADE: average Euclidean displacement over all prediction timesteps and vessels
+    - FDE: Euclidean displacement at the final prediction timestep, averaged over vessels
     """
     model.eval()
-    
-    all_min_ade = []
+
+    all_ade = []
     all_fde = []
     total_sequences = 0
-    
-    print(f"\nEvaluating with best-of-{num_samples} sampling...")
-    print(f"Metrics will be computed in real-world coordinates (degrees)")
+
+    print(f"\nEvaluating (deterministic — Gaussian mean only)...")
     print(f"Total batches: {len(loader)}")
-    
+
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
-            # Get data
+        for batch in tqdm(loader, desc="Evaluating"):
+
             batch = [tensor.to(device) for tensor in batch]
-            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
-            loss_mask, V_obs, V_tr = batch
-            
-            T = V_obs.shape[1]   # obs_len
-            N = V_obs.shape[2]   # num vessels in this sequence
-            
-            # Identity matrices (original repo)
+            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, \
+                non_linear_ped, loss_mask, V_obs, V_tr = batch
+
+            T = V_obs.shape[1]
+            N = V_obs.shape[2]
+
             identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
             identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
             identity = [identity_spatial, identity_temporal]
-            
-            # Forward pass - get Gaussian parameters (in normalized space)
-            # Model predicts VELOCITIES (matching V_tr training target)
-            V_pred = model(V_obs, identity)  # [pred_len, N, 5]
-            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
 
-            # Last observed absolute position (normalized): [N, 2]
-            # obs_traj: [N, 4, obs_len] → last timestep → first 2 features (LON, LAT)
-            last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
+            # Forward pass → Gaussian parameters [pred_len, N, 5]
+            V_pred = model(V_obs, identity)
+            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
-            # Convert predicted velocity Gaussian parameters to absolute position Gaussian:
-            # μ_abs[t] = last_obs + cumsum(μ_vel[0:t+1])
-            # σ stays the same (velocity σ ≈ position σ for small steps)
-            mu_vel = V_pred[:, :, :2]  # [pred_len, N, 2]
-            mu_abs = torch.cumsum(mu_vel, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
+            # --- DETERMINISTIC: use only μx, μy (Gaussian mean) ---
+            mu_vel = V_pred[:, :, :2]  # [pred_len, N, 2] predicted velocity mean
 
-            # Build absolute-position Gaussian parameters [pred_len, N, 5]
+            # Convert velocities → absolute positions
+            last_obs = obs_traj.squeeze(0)[:, :2, -1]          # [N, 2]
+            mu_abs   = torch.cumsum(mu_vel, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
+
+            # Ground truth absolute positions [pred_len, N, 2]
+            V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]
+
+            # Denormalize to real-world coordinates (degrees)
             V_pred_abs = V_pred.clone()
-            V_pred_abs[:, :, :2] = mu_abs  # replace velocity means with absolute means
+            V_pred_abs[:, :, :2] = mu_abs
+            pred_denorm   = denormalize_predictions(V_pred_abs, global_stats)[:, :, :2]
+            target_denorm = denormalize_coordinates(V_target, global_stats)
 
-            # Target: absolute positions from pred_traj_gt [pred_len, N, 2]
-            V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]  # [pred_len, N, 2]
+            # Euclidean displacement at each timestep: [pred_len, N]
+            displacements = torch.sqrt(
+                (pred_denorm[:, :, 0] - target_denorm[:, :, 0])**2 +
+                (pred_denorm[:, :, 1] - target_denorm[:, :, 1])**2
+            )
 
-            # DENORMALIZE to real-world coordinates (degrees)
-            V_pred_denorm = denormalize_predictions(V_pred_abs, global_stats)
-            V_target_denorm = denormalize_coordinates(V_target, global_stats)
-            
-            # Evaluate with best-of-K sampling in REAL-WORLD coordinates
-            results = evaluate_best_of_k(V_pred_denorm, V_target_denorm, num_samples=num_samples)
-            
-            all_min_ade.append(results['minADE'])
-            all_fde.append(results['FDE'])
+            # ADE: mean over all timesteps and vessels (S&F definition)
+            ade = displacements.mean().item()
+
+            # FDE: mean over vessels at final timestep only (S&F definition)
+            fde = displacements[-1, :].mean().item()
+
+            all_ade.append(ade)
+            all_fde.append(fde)
             total_sequences += 1
-    
-    # Compute average metrics
-    avg_min_ade = np.mean(all_min_ade)
+
+    avg_ade = np.mean(all_ade)
     avg_fde = np.mean(all_fde)
-    
+
     return {
-        'minADE': avg_min_ade,
-        'FDE': avg_fde,
+        'ADE_deg': avg_ade,
+        'FDE_deg': avg_fde,
+        'ADE_nm':  avg_ade * NM_PER_DEG,
+        'FDE_nm':  avg_fde * NM_PER_DEG,
         'total_sequences': total_sequences,
-        'all_min_ade': all_min_ade,
-        'all_fde': all_fde
     }
 
 
 def main():
-    args = setup_args()
-    
-    # Setup device
+    args   = setup_args()
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
+
     # Load dataset
     data_path = os.path.join('./dataset', args.dataset, args.split)
     print(f"\nLoading dataset from: {data_path}")
-    
+
     dataset = TrajectoryDataset(
         data_path,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         skip=1
     )
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0
-    )
-    
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     print(f"Dataset loaded: {len(dataset)} sequences")
-    
-    # Load global statistics for denormalization
+
+    # Load global statistics
     global_stats_path = os.path.join('./dataset', args.dataset, 'global_stats.json')
     print(f"\nLoading global statistics from: {global_stats_path}")
-    
+
     if not os.path.exists(global_stats_path):
         raise FileNotFoundError(
             f"Global statistics file not found: {global_stats_path}\n"
-            f"Please run preprocessing first (preprocess_ais.py) to generate this file."
+            f"Run preprocessing first: python preprocess_ais.py"
         )
-    
+
     with open(global_stats_path, 'r') as f:
         global_stats = json.load(f)
-    
+
     print(f"Global stats loaded:")
-    print(f"  LON: mean={global_stats['LON']['mean']:.4f}, std={global_stats['LON']['std']:.4f}")
-    print(f"  LAT: mean={global_stats['LAT']['mean']:.4f}, std={global_stats['LAT']['std']:.4f}")
-    
+    for feat in ['LON', 'LAT', 'SOG', 'Heading']:
+        if feat in global_stats:
+            print(f"  {feat}: mean={global_stats[feat]['mean']:.4f}, "
+                  f"std={global_stats[feat]['std']:.4f}")
+
     # Initialize model
     print(f"\nInitializing model...")
     model = TrajectoryModel(
         number_asymmetric_conv_layer=2,
         embedding_dims=args.embedding_dims,
         number_gcn_layers=args.num_gcn_layers,
-        dropout=0.0,  # No dropout during evaluation
+        dropout=0.0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=5,  # Gaussian parameters: μx, μy, log(σx), log(σy), ρ
+        out_dims=5,
         num_heads=args.num_heads
     ).to(device)
-    
+
     # Load checkpoint
-    print(f"Loading checkpoint from: {args.checkpoint}")
+    print(f"Loading checkpoint: {args.checkpoint}")
     if not os.path.exists(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
-    
+
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint)
     print("Checkpoint loaded successfully!")
-    
-    # Evaluate with denormalization (paper-aligned)
-    results = evaluate_model(model, loader, device, global_stats, num_samples=args.num_samples)
-    
+
+    # Evaluate
+    results = evaluate_model(model, loader, device, global_stats)
+
     # Print results
-    print(f"\n{'='*80}")
-    print(f"EVALUATION RESULTS (Best-of-{args.num_samples}) - PAPER ALIGNED")
-    print(f"{'='*80}")
-    print(f"Dataset: {args.dataset} ({args.split} split)")
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print(f"EVALUATION RESULTS — SMCHN vs Sekhon & Fleming 2020")
+    print(f"{sep}")
+    print(f"Dataset:    {args.dataset} ({args.split} split)")
     print(f"Checkpoint: {args.checkpoint}")
-    print(f"Total sequences: {results['total_sequences']}")
-    print(f"\nMetrics (in real-world coordinates - degrees):")
-    print(f"  minADE-{args.num_samples}: {results['minADE']:.6f}°")
-    print(f"  FDE (of best sample):      {results['FDE']:.6f}°")
-    print(f"\nNote: Metrics computed after denormalization using global_stats.json")
-    print(f"      Expected range: 0.001-0.003° (as per paper)")
-    print(f"{'='*80}")
-    
-    # Optionally save detailed results
-    output_dir = os.path.dirname(args.checkpoint)
-    results_file = os.path.join(output_dir, f'eval_results_{args.split}_K{args.num_samples}.txt')
-    
+    print(f"Sequences:  {results['total_sequences']}")
+    print(f"Obs/Pred:   {args.obs_len} min / {args.pred_len} min")
+    print(f"Method:     Deterministic (Gaussian mean only)")
+    print(f"\n--- Metrics in DEGREES (°) ---")
+    print(f"  ADE: {results['ADE_deg']:.6f}°")
+    print(f"  FDE: {results['FDE_deg']:.6f}°")
+    print(f"\n--- Metrics in NAUTICAL MILES (nm) — S&F 2020 units ---")
+    print(f"  ADE: {results['ADE_nm']:.6f} nm")
+    print(f"  FDE: {results['FDE_nm']:.6f} nm")
+    print(f"\n--- Sekhon & Fleming 2020 (reference) ---")
+    print(f"  ADE (LSTM+Spatial+Temporal): 0.03314 nm")
+    print(f"  FDE (LSTM+Spatial+Temporal): 0.03840 nm")
+    print(f"{sep}")
+
+    # Save results
+    output_dir   = os.path.dirname(args.checkpoint)
+    results_file = os.path.join(
+        output_dir, f'eval_results_{args.split}_deterministic.txt'
+    )
+
     with open(results_file, 'w') as f:
-        f.write(f"Evaluation Results (Best-of-{args.num_samples}) - PAPER ALIGNED\n")
-        f.write(f"{'='*80}\n")
-        f.write(f"Dataset: {args.dataset} ({args.split} split)\n")
+        f.write(f"EVALUATION RESULTS — SMCHN vs Sekhon & Fleming 2020\n")
+        f.write(f"{'='*70}\n")
+        f.write(f"Dataset:    {args.dataset} ({args.split} split)\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
-        f.write(f"Total sequences: {results['total_sequences']}\n\n")
-        f.write(f"Metrics (in real-world coordinates - degrees):\n")
-        f.write(f"minADE-{args.num_samples}: {results['minADE']:.6f}°\n")
-        f.write(f"FDE (of best sample):      {results['FDE']:.6f}°\n\n")
-        f.write(f"Note: Metrics computed after denormalization using global_stats.json\n")
-        f.write(f"      Expected range: 0.001-0.003° (as per paper)\n")
-    
+        f.write(f"Sequences:  {results['total_sequences']}\n")
+        f.write(f"Obs/Pred:   {args.obs_len} min / {args.pred_len} min\n")
+        f.write(f"Method:     Deterministic (Gaussian mean only)\n\n")
+        f.write(f"--- Metrics in DEGREES ---\n")
+        f.write(f"ADE: {results['ADE_deg']:.6f}°\n")
+        f.write(f"FDE: {results['FDE_deg']:.6f}°\n\n")
+        f.write(f"--- Metrics in NAUTICAL MILES (S&F 2020 units) ---\n")
+        f.write(f"ADE: {results['ADE_nm']:.6f} nm\n")
+        f.write(f"FDE: {results['FDE_nm']:.6f} nm\n\n")
+        f.write(f"--- Sekhon & Fleming 2020 (reference) ---\n")
+        f.write(f"ADE (LSTM+Spatial+Temporal): 0.03314 nm\n")
+        f.write(f"FDE (LSTM+Spatial+Temporal): 0.03840 nm\n")
+
     print(f"\nResults saved to: {results_file}")
 
 
