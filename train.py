@@ -3,16 +3,16 @@ import sys
 import time
 import argparse
 import pickle
-import glob
+import numpy as np
 
 # Parse GPU selection before importing torch
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu_num', default="0", type=str, help='GPU device number')
 parser.add_argument('--obs_len', type=int, default=5,
-                    help='Observation sequence length (5 min, aligned with Sekhon & Fleming 2020)')
+                    help='Observation sequence length (5 min, S&F aligned)')
 parser.add_argument('--pred_len', type=int, default=5,
-                    help='Prediction sequence length (5 min, aligned with Sekhon & Fleming 2020)')
-parser.add_argument('--dataset', default='noaa_jan2017',
+                    help='Prediction sequence length (5 min, S&F aligned)')
+parser.add_argument('--dataset', default='noaa_jan2017_sf',
                     help='Dataset name (folder under ./dataset/)')
 parser.add_argument('--batch_size', type=int, default=32,
                     help='minibatch size (used for gradient accumulation)')
@@ -28,6 +28,10 @@ parser.add_argument('--use_lrschd', action="store_true", default=False,
                     help='Use lr rate scheduler')
 parser.add_argument('--tag', default='SMCHN_5_5',
                     help='personal tag for the model')
+parser.add_argument('--feature_size', type=int, default=2,
+                    help='Input feature size (2=LAT/LON only, S&F aligned)')
+parser.add_argument('--split_data', action="store_true", default=False,
+                    help='Force re-split of dataset')
 
 # Parse early to set CUDA device before importing torch
 args_early, _ = parser.parse_known_args()
@@ -41,7 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from metrics import *
 from model import *
-from utils import *
+from utils import load_data
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -69,11 +73,6 @@ def graph_loss(V_pred, V_target):
 
 
 def make_identity(T, N, device):
-    """
-    Identity matrices for self-connection (original repo).
-    spatial:  (T, N, N) — diagonal matrices stacked over T timesteps
-    temporal: (N, T, T) — diagonal matrices stacked over N vessels
-    """
     identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
     identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
     return [identity_spatial, identity_temporal]
@@ -108,11 +107,10 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         identity = make_identity(T, N, device)
 
         V_pred = model(V_obs, identity)
-        V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
+        V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
-        V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
+        V_target = V_tr.squeeze(0)
 
-        # Gradient accumulation
         if batch_count % args.batch_size != 0 and cnt != turn_point:
             l = graph_loss(V_pred, V_target)
             if is_fst_loss:
@@ -144,10 +142,6 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
 
 
 def vald(epoch, model, checkpoint_dir, loader_val):
-    """
-    Validation loop.
-    NOTE: For paper-aligned evaluation (minADE-20, minFDE-20), use evaluate.py.
-    """
     global metrics, constant_metrics
     model.eval()
 
@@ -170,9 +164,9 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             identity = make_identity(T, N, device)
 
             V_pred = model(V_obs, identity)
-            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
+            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
-            V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
+            V_target = V_tr.squeeze(0)
 
             if batch_count % args.batch_size != 0 and cnt != turn_point:
                 l = graph_loss(V_pred, V_target)
@@ -198,60 +192,25 @@ def vald(epoch, model, checkpoint_dir, loader_val):
 
 
 def main(args):
-    obs_seq_len  = args.obs_len
-    pred_seq_len = args.pred_len
+    data_dir = os.path.join('./dataset', args.dataset)
 
-    data_set = './dataset/' + args.dataset + '/'
+    # Load data with random 80/10/10 split (S&F aligned)
+    traindataset, validdataset, testdataset = load_data(data_dir, args)
 
-    def _get_split_csv_files(split_name):
-        split_dir = os.path.join(data_set, split_name)
-        csv_files = sorted(glob.glob(os.path.join(split_dir, '*.csv')))
-        return split_dir, csv_files
-
-    train_dir, train_csv_files = _get_split_csv_files('train')
-    if not train_csv_files:
-        raise RuntimeError(
-            f"Dataset split 'train' has no CSV files in {train_dir}. "
-            f"Run preprocessing first: python preprocess_ais.py"
-        )
-
-    val_dir, val_csv_files = _get_split_csv_files('val')
-    val_split = 'val'
-    if not val_csv_files:
-        print(f"WARNING: No CSV files found in {val_dir}. Falling back to train split.")
-        val_split = 'train'
-
-    dset_train = TrajectoryDataset(
-        data_set + 'train/',
-        obs_len=obs_seq_len,
-        pred_len=pred_seq_len,
-        skip=1)
-
-    loader_train = DataLoader(
-        dset_train,
-        batch_size=1,
-        shuffle=True,
-        num_workers=0)
-
-    dset_val = TrajectoryDataset(
-        data_set + val_split + '/',
-        obs_len=obs_seq_len,
-        pred_len=pred_seq_len,
-        skip=1)
-
-    loader_val = DataLoader(
-        dset_val,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0)
+    loader_train = DataLoader(traindataset, batch_size=1, shuffle=True,  num_workers=0)
+    loader_val   = DataLoader(validdataset, batch_size=1, shuffle=False, num_workers=0)
 
     print('Training started ...')
     print(f'Using device: {device}')
     print(f'Dataset: {args.dataset}')
-    print(f'obs_len={obs_seq_len} min, pred_len={pred_seq_len} min (Sekhon & Fleming 2020 aligned)')
+    print(f'obs_len={args.obs_len} min, pred_len={args.pred_len} min (S&F aligned)')
+    print(f'feature_size={args.feature_size} ({"LAT/LON only" if args.feature_size==2 else "LAT/LON/SOG/Heading"})')
 
     writer = SummaryWriter(f"runs/{args.tag}_{args.dataset}_{time.strftime('%Y%m%d-%H%M%S')}")
 
+    # SMCHN model: input features = feature_size + 1 (pos_enc)
+    # SparseWeightedAdjacency expects spa_in_dims = feature_size (after slicing pos_enc)
+    # tem_in_dims = feature_size + 1 (with pos_enc)
     model = TrajectoryModel(
         number_asymmetric_conv_layer=2,
         embedding_dims=64,
@@ -259,7 +218,8 @@ def main(args):
         dropout=0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=5
+        out_dims=5,
+        num_heads=4
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -269,7 +229,7 @@ def main(args):
             optimizer, milestones=[0, 100], gamma=0.1
         )
 
-    checkpoint_dir = './checkpoints/' + args.tag + '/' + args.dataset + '/'
+    checkpoint_dir = os.path.join('./checkpoints', args.tag, args.dataset) + '/'
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 

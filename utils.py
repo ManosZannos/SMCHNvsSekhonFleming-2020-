@@ -2,14 +2,17 @@
 utils.py
 
 Includes:
-1) NOAA AIS preprocessing functions (used by preprocess_sf.py)
+1) Helper functions for AIS data loading
 
-2) TrajectoryDataset: exact replication of Sekhon & Fleming 2020 data.py
+2) TrajectoryDataset: aligned with Sekhon & Fleming 2020 data.py
    - Scene-based sliding window
    - shift = obs_len (no overlap)
-   - feature_size = 2 (LAT, LON only, as in S&F paper)
-   - Filters: valid vessels (moving + present in all obs timestamps)
-   - Condition: total_vessels > 3
+   - feature_size = 2 (LAT, LON only)
+   - Random 80/10/10 split at sample level (matching S&F random_split)
+   - Filter: valid vessels (moving + present in all obs timestamps)
+   - Condition: len(valid_vessels) > 3
+
+3) load_data: random split function matching S&F data.py load_data()
 """
 
 import os
@@ -20,21 +23,13 @@ import torch
 import numpy as np
 import pandas as pd
 
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, random_split
 from tqdm import tqdm
 
 
 # ============================================================================
-# AIS / NOAA PREPROCESSING
+# AIS / NOAA PREPROCESSING HELPERS
 # ============================================================================
-
-NOAA_REQUIRED_COLS = ["MMSI", "BaseDateTime", "LAT", "LON", "SOG", "Heading"]
-
-
-def _valid_mmsi_9digits(series: pd.Series) -> pd.Series:
-    s = series.astype("Int64").astype(str)
-    return s.str.fullmatch(r"\d{9}")
-
 
 def load_noaa_csv(csv_or_zip_path: str, inner_csv_name: str | None = None, nrows: int | None = None) -> pd.DataFrame:
     """Load NOAA AIS daily CSV from either a .csv or a .zip path."""
@@ -51,7 +46,7 @@ def load_noaa_csv(csv_or_zip_path: str, inner_csv_name: str | None = None, nrows
 
 
 # ============================================================================
-# ORIGINAL UTILITY FUNCTIONS
+# UTILITY FUNCTIONS
 # ============================================================================
 
 def anorm(p1, p2):
@@ -79,7 +74,6 @@ def seq_to_graph(seq_, seq_rel, pos_enc=False):
     Builds node feature tensor V from RELATIVE features (velocities).
 
     S&F uses feature_size=2 (LAT, LON only).
-    SMCHN uses feature_size=4 (LON, LAT, SOG, Heading).
 
     Args:
         seq_:    (N, F, seq_len) — absolute positions
@@ -114,10 +108,7 @@ def poly_fit(traj, traj_len, threshold):
 
 
 def get_features(ip, t):
-    """
-    Compute distance, bearing, heading matrices for spatial attention.
-    Used by S&F model. ip: (N, F, T)
-    """
+    """Compute distance, bearing, heading matrices. ip: (N, F, T)"""
     N = ip.shape[0]
     distance_matrix = torch.zeros(ip.shape[2], N, N)
     bearing_matrix  = torch.zeros(ip.shape[2], N, N)
@@ -126,20 +117,19 @@ def get_features(ip, t):
 
 
 # ============================================================================
-# TRAJECTORY DATASET — Exact replication of S&F data.py
+# TRAJECTORY DATASET — aligned with S&F data.py
 # ============================================================================
 
 class TrajectoryDataset(Dataset):
     """
-    Exact replication of Sekhon & Fleming 2020 data.py trajectory_dataset.
+    Scene-based sliding window dataset aligned with Sekhon & Fleming 2020.
 
-    Key properties (matching S&F):
-    - feature_size=2: uses only LAT, LON (columns 3,2 in frame format)
-    - shift = sequence_length (obs_len): no overlap between windows
-    - Scene-based: each sample contains ALL vessels present in obs window
+    Key properties:
+    - feature_size=2: LAT, LON only (S&F paper)
+    - shift = obs_len: no overlap between windows
     - Valid vessels: present in ALL obs timesteps AND moving (diff > 1e-04)
-    - Condition: total_vessels > 3 AND len(valid_vessels) == total_vessels
-    - Normalization already applied in preprocessing (preprocess_sf.py)
+    - Condition: len(valid_vessels) > 3 (>=4 valid moving vessels)
+    - Normalization already applied in preprocess_sf.py
     """
 
     def __init__(
@@ -147,11 +137,11 @@ class TrajectoryDataset(Dataset):
         data_dir,
         obs_len=5,
         pred_len=5,
-        skip=1,           # kept for API compatibility, S&F uses shift=obs_len internally
+        skip=1,
         threshold=0.002,
         min_ped=1,
         delim=",",
-        feature_size=2,   # S&F uses 2 (LAT, LON only)
+        feature_size=2,
     ):
         super(TrajectoryDataset, self).__init__()
 
@@ -159,8 +149,7 @@ class TrajectoryDataset(Dataset):
         self.pred_len     = pred_len
         self.seq_len      = obs_len + pred_len
         self.feature_size = feature_size
-        # S&F: shift = sequence_length (obs_len) — no overlap
-        self.shift        = obs_len
+        self.shift        = obs_len  # S&F: shift = sequence_length
         self.max_peds_in_frame = 0
 
         all_files = sorted([
@@ -178,8 +167,6 @@ class TrajectoryDataset(Dataset):
         non_linear_ped_list = []
 
         for path in all_files:
-            # Load frame-format CSV
-            # Columns: frame_id, vessel_id, LON, LAT, SOG, Heading
             data    = pd.read_csv(path)
             data_np = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].values.astype(np.float32)
 
@@ -194,7 +181,7 @@ class TrajectoryDataset(Dataset):
 
                 frame_timestamps = timestamps[j:j + self.seq_len]
 
-                # --- S&F _condition_time: max 1 min gap between consecutive timestamps ---
+                # S&F _condition_time: consecutive timestamps (max 1 min gap)
                 diffs = np.diff(frame_timestamps)
                 if np.any(diffs > 1):
                     j += self.shift
@@ -209,38 +196,29 @@ class TrajectoryDataset(Dataset):
                 obs_mask       = np.isin(frame[:, 0], obs_timestamps)
                 obs_frame      = frame[obs_mask]
 
-                total_vessels = len(np.unique(obs_frame[:, 1]))
-
-                # --- S&F _condition_vessels ---
-                # Valid vessel: present in ALL obs timesteps AND moving
+                # Valid vessels: present in ALL obs timesteps AND moving
                 valid_vessels = []
                 for v in np.unique(obs_frame[:, 1]):
                     v_data = obs_frame[obs_frame[:, 1] == v]
 
-                    # Must be present in ALL obs timesteps
                     if len(v_data) != self.obs_len:
                         continue
 
-                    # Must be moving: LAT diff > 1e-04 OR LON diff > 1e-04
-                    # S&F checks: not (abs(LAT.diff).max() < 1e-04)
-                    #             and not (abs(LON.diff).max() < 1e-04)
-                    lat_diff = np.abs(np.diff(v_data[:, 3])).max()  # LAT col 3
-                    lon_diff = np.abs(np.diff(v_data[:, 2])).max()  # LON col 2
+                    lat_diff = np.abs(np.diff(v_data[:, 3])).max()
+                    lon_diff = np.abs(np.diff(v_data[:, 2])).max()
 
                     if lat_diff < 1e-04 and lon_diff < 1e-04:
                         continue
 
                     valid_vessels.append(v)
 
-                # S&F rejects if there are 3 or fewer valid vessels
+                # Require > 3 valid moving vessels
                 if len(valid_vessels) <= 3:
                     j += self.shift
                     continue
 
-                # Build sequence tensors for valid vessels
                 self.max_peds_in_frame = max(self.max_peds_in_frame, len(valid_vessels))
 
-                # Use ALL features (4) in storage, apply feature_size slice later
                 curr_seq       = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
                 curr_seq_rel   = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
                 curr_loss_mask = np.zeros((len(valid_vessels), self.seq_len),    dtype=np.float32)
@@ -251,7 +229,6 @@ class TrajectoryDataset(Dataset):
                 for v in valid_vessels:
                     v_frame = frame[frame[:, 1] == v]
 
-                    # Build full seq_len trajectory
                     traj   = np.zeros((4, self.seq_len), dtype=np.float32)
                     mask_v = np.zeros(self.seq_len, dtype=np.float32)
 
@@ -260,7 +237,7 @@ class TrajectoryDataset(Dataset):
                         if len(t_idx) == 0:
                             continue
                         t_idx = t_idx[0]
-                        traj[:, t_idx] = row[2:6]  # LON, LAT, SOG, Heading
+                        traj[:, t_idx] = row[2:6]
                         mask_v[t_idx]  = 1.0
 
                     rel_traj = np.zeros_like(traj)
@@ -296,7 +273,6 @@ class TrajectoryDataset(Dataset):
         loss_mask_arr  = np.concatenate(loss_mask_list, axis=0)
         non_linear_arr = np.asarray(non_linear_ped_list, dtype=np.float32)
 
-        # Store full 4-feature tensors, slice to feature_size in __getitem__
         self.obs_traj      = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
         self.pred_traj     = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
         self.obs_traj_rel  = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
@@ -316,8 +292,6 @@ class TrajectoryDataset(Dataset):
             pbar.update(1)
             start, end = self.seq_start_end[ss]
 
-            # Apply feature_size slice (S&F uses 2: LAT, LON)
-            # Note: columns are [LON, LAT, SOG, Heading] → slice [:feature_size]
             obs_fs  = self.obs_traj[start:end, :self.feature_size, :]
             obs_rel = self.obs_traj_rel[start:end, :self.feature_size, :]
             prd_fs  = self.pred_traj[start:end, :self.feature_size, :]
@@ -335,11 +309,10 @@ class TrajectoryDataset(Dataset):
     def __getitem__(self, index):
         start, end = self.seq_start_end[index]
 
-        # Apply feature_size slice
-        obs_traj     = self.obs_traj[start:end, :self.feature_size, :]
-        pred_traj    = self.pred_traj[start:end, :self.feature_size, :]
-        obs_traj_rel = self.obs_traj_rel[start:end, :self.feature_size, :]
-        pred_traj_rel= self.pred_traj_rel[start:end, :self.feature_size, :]
+        obs_traj      = self.obs_traj[start:end, :self.feature_size, :]
+        pred_traj     = self.pred_traj[start:end, :self.feature_size, :]
+        obs_traj_rel  = self.obs_traj_rel[start:end, :self.feature_size, :]
+        pred_traj_rel = self.pred_traj_rel[start:end, :self.feature_size, :]
 
         return [
             obs_traj,
@@ -351,3 +324,68 @@ class TrajectoryDataset(Dataset):
             self.v_obs[index],
             self.v_pred[index],
         ]
+
+
+# ============================================================================
+# LOAD DATA — Random 80/10/10 split at sample level (matching S&F data.py)
+# ============================================================================
+
+def load_data(data_dir, args):
+    """
+    Replicates S&F data.py load_data():
+    - Loads all processed CSVs from processed/ folder
+    - Random 80/10/10 split at sample level
+    - Saves splits to train/val/test folders
+
+    Args:
+        data_dir: path to dataset/noaa_jan2017_sf/
+        args: namespace with obs_len, pred_len, feature_size, split_data
+    """
+    processed_dir = os.path.join(data_dir, "processed")
+    train_dir     = os.path.join(data_dir, "train")
+    val_dir       = os.path.join(data_dir, "val")
+    test_dir      = os.path.join(data_dir, "test")
+
+    for d in [train_dir, val_dir, test_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    train_pt = os.path.join(train_dir, f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
+    val_pt   = os.path.join(val_dir,   f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
+    test_pt  = os.path.join(test_dir,  f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
+
+    if getattr(args, 'split_data', False) or not os.path.exists(train_pt):
+        print(f"Building dataset from {processed_dir}...")
+
+        data = TrajectoryDataset(
+            processed_dir,
+            obs_len=args.obs_len,
+            pred_len=args.pred_len,
+            feature_size=getattr(args, 'feature_size', 2)
+        )
+
+        data_size  = len(data)
+        val_size   = int(np.floor(0.1 * data_size))
+        test_size  = val_size
+        train_size = data_size - val_size - test_size
+
+        print(f"\nTotal samples: {data_size}")
+        print(f"Train: {train_size} | Val: {val_size} | Test: {test_size}")
+
+        # Random split (matching S&F)
+        traindataset, validdataset, testdataset = random_split(
+            data, [train_size, val_size, test_size]
+        )
+
+        torch.save(traindataset, train_pt)
+        torch.save(validdataset, val_pt)
+        torch.save(testdataset,  test_pt)
+
+        print(f"✓ Saved splits to {data_dir}")
+
+    else:
+        print(f"Loading existing splits from {data_dir}...")
+        traindataset = torch.load(train_pt)
+        validdataset = torch.load(val_pt)
+        testdataset  = torch.load(test_pt)
+
+    return traindataset, validdataset, testdataset
