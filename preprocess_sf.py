@@ -199,8 +199,8 @@ def split_into_grids(df, grid_size=GRID_SIZE):
                 if len(timestamps) >= MIN_TIMESTAMPS and len(vessels) > MIN_VESSELS:
                     grids.append(df_grid.copy())
 
-            l2 += 0.1
-        l += 0.1
+            l2 += GRID_SIZE  # 0.2
+        l += GRID_SIZE  # 0.2
 
     return grids
 
