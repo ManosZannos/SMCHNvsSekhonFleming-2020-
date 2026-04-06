@@ -5,9 +5,12 @@ Includes:
 1) NOAA AIS preprocessing (paper-aligned) -> frame-format CSV compatible with TrajectoryDataset:
    frame_id, vessel_id, LON, LAT, SOG, Heading
 
-2) TrajectoryDataset: trajectory-wise sliding window (paper-aligned).
-   Each window is anchored to a single vessel's continuous trajectory segment.
-   Interaction graph at each timestep includes ALL vessels present in those frames.
+2) TrajectoryDataset: scene-based sliding window (aligned with Sekhon & Fleming 2020).
+   Each window covers ALL vessels present in a scene at consecutive timestamps.
+   This matches S&F data.py logic:
+   - shift = sequence_length (obs_len) — no overlap between windows
+   - sample = all vessels present in obs window
+   - filters: consecutive timestamps, vessels moving, >= 3 valid vessels
 
 NOTE: Status column removed — not present in 2017 NOAA AIS data.
 """
@@ -69,7 +72,6 @@ def clean_abnormal_data_noaa(
 
     NOTE: Status column excluded — not present in 2017 NOAA AIS data.
     """
-    # Check only required columns (no Status)
     missing = [c for c in NOAA_REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
@@ -110,16 +112,6 @@ def resample_interpolate_1min(
 ) -> pd.DataFrame:
     """
     Paper Step 2: Data interpolation (gap-aware).
-
-    Quote from paper:
-    "For data with a time interval of more than one minute between consecutive
-    trajectory points, the missing value of LON and LAT is supplemented by the
-    linear interpolation method."
-
-    KEY FIX: before resampling, each vessel's trajectory is split into segments
-    at gaps > max_gap_minutes. Only genuine short gaps (≤ max_gap_minutes) are
-    interpolated. Large gaps (e.g. vessel left area for hours) are NOT bridged
-    with fake linear stretches.
 
     NOTE: Status column excluded — not present in 2017 NOAA AIS data.
     """
@@ -172,7 +164,7 @@ def resample_interpolate_1min(
                 )
                 r[c] = s.ffill().bfill()
 
-            # Status excluded — not present in 2017 data
+            # Status excluded
             r = r.dropna(subset=["LON", "LAT", "SOG", "Heading"])
 
             if len(r) == 0:
@@ -241,7 +233,6 @@ def zscore_normalize_global(df: pd.DataFrame, cols=("LON", "LAT", "SOG", "Headin
 def to_frame_format(df: pd.DataFrame) -> pd.DataFrame:
     """
     Paper Step 5: Convert to frame format.
-
     Output columns: frame_id, vessel_id, LON, LAT, SOG, Heading
     """
     print(f"\n[Step 5/5] Converting to frame format...")
@@ -339,13 +330,6 @@ def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
     Builds node feature tensor V from RELATIVE features (velocities).
 
-    Original repo (paper-faithful):
-      - V always contains seq_rel (velocities), NOT absolute positions
-      - When pos_enc=True, prepends a positional index as extra feature
-        → output shape: (seq_len, N, 5) with [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-      - When pos_enc=False:
-        → output shape: (seq_len, N, 4) with [LON_rel, LAT_rel, SOG_rel, Heading_rel]
-
     Args:
         seq_:    (N, 4, seq_len) — absolute positions
         seq_rel: (N, 4, seq_len) — velocities (differences between consecutive steps)
@@ -379,22 +363,30 @@ def poly_fit(traj, traj_len, threshold):
 
 
 # ============================================================================
-# TRAJECTORY DATASET (PAPER-ALIGNED: day-level frame sliding window)
+# TRAJECTORY DATASET — Scene-based sliding window
+# Aligned with Sekhon & Fleming 2020 (data.py)
 # ============================================================================
 
 class TrajectoryDataset(Dataset):
     """
-    Dataloader for AIS trajectory datasets in frame format:
-      frame_id, vessel_id, LON, LAT, SOG, Heading
-
-    PAPER-ALIGNED APPROACH (Section 3.2.1):
-      "All vessels in the sea area are constructed as the graph at each time step"
+    Scene-based sliding window dataset aligned with Sekhon & Fleming 2020.
 
     For each day CSV:
-      1. Build list of unique frame_ids (minutes of the day)
-      2. Slide a window of seq_len frames over the day
-      3. For each window, keep only vessels present in ALL seq_len frames
-      4. Require at least min_ped vessels per window
+      1. Get all unique timestamps (frames)
+      2. Slide a window of seq_len=(obs_len+pred_len) frames
+         with shift=obs_len (no overlap between windows)
+      3. For each window:
+         - Check timestamps are consecutive (max 1 min gap)
+         - Find vessels present in ALL obs_len timestamps
+         - Keep only vessels that are moving (LAT/LON diff > 1e-04)
+         - Require >= 3 valid vessels (total_vessels > 3, i.e. >=4... 
+           actually S&F uses total_vessels <= 3 to reject, so we need > 3)
+      4. Build sequence tensors for all valid vessels
+
+    This matches S&F data.py behavior:
+      - shift = sequence_length (obs_len)
+      - valid_vessels filter: moving + present in all obs timestamps
+      - condition: total_vessels > 3
     """
 
     def __init__(
@@ -412,7 +404,8 @@ class TrajectoryDataset(Dataset):
         self.obs_len  = obs_len
         self.pred_len = pred_len
         self.seq_len  = obs_len + pred_len
-        self.skip     = skip
+        # S&F uses shift = sequence_length (obs_len) — no overlap
+        self.shift    = obs_len
         self.max_peds_in_frame = 0
 
         all_files = sorted([
@@ -423,63 +416,100 @@ class TrajectoryDataset(Dataset):
         if not all_files:
             raise ValueError(f"No CSV files found in {data_dir}")
 
-        num_peds_in_seq    = []
-        seq_list           = []
-        seq_list_rel       = []
-        loss_mask_list     = []
+        num_peds_in_seq     = []
+        seq_list            = []
+        seq_list_rel        = []
+        loss_mask_list      = []
         non_linear_ped_list = []
 
         for path in all_files:
             data    = pd.read_csv(path)
             data_np = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].values.astype(np.float32)
 
-            frames      = np.unique(data_np[:, 0]).tolist()
-            n_frames    = len(frames)
-            frame_to_idx = {frame: i for i, frame in enumerate(frames)}
-            frame_data  = [data_np[data_np[:, 0] == frame] for frame in frames]
+            # All unique timestamps sorted
+            timestamps = np.unique(data_np[:, 0])
+            n_frames   = len(timestamps)
 
             vessel_ids_in_file = np.unique(data_np[:, 1])
             print(f"  {os.path.basename(path)}: {len(vessel_ids_in_file)} vessels, {n_frames} frames")
 
-            num_sequences = max(0, (n_frames - self.seq_len) // self.skip + 1)
+            j = 0
+            while not (j + self.seq_len) > n_frames:
+                # Current window timestamps
+                frame_timestamps = timestamps[j:j + self.seq_len]
 
-            for idx in range(0, num_sequences * self.skip, self.skip):
-                if idx + self.seq_len > n_frames:
-                    break
+                # --- S&F condition_time: check consecutive (max 1 min gap) ---
+                # timestamps are in minutes (frame_id), so diff should be 1
+                diffs = np.diff(frame_timestamps)
+                if np.any(diffs > 1):
+                    j += self.shift
+                    continue
 
-                curr_seq_data    = np.concatenate(frame_data[idx: idx + self.seq_len], axis=0)
-                peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
-                self.max_peds_in_frame = max(self.max_peds_in_frame, len(peds_in_curr_seq))
+                # Get all rows in this window
+                mask  = np.isin(data_np[:, 0], frame_timestamps)
+                frame = data_np[mask]
 
-                curr_seq       = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
-                curr_seq_rel   = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
-                curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len),    dtype=np.float32)
+                # Obs timestamps only (for vessel filtering)
+                obs_timestamps = frame_timestamps[:self.obs_len]
+                obs_mask       = np.isin(frame[:, 0], obs_timestamps)
+                obs_frame      = frame[obs_mask]
+
+                total_vessels = len(np.unique(obs_frame[:, 1]))
+
+                # --- S&F condition_vessels ---
+                # valid_vessels: present in ALL obs timestamps AND moving
+                valid_vessels = []
+                for v in np.unique(obs_frame[:, 1]):
+                    v_data = obs_frame[obs_frame[:, 1] == v]
+                    # Must be present in all obs timesteps
+                    if len(v_data) != self.obs_len:
+                        continue
+                    # Must be moving (LAT diff > 1e-04 OR LON diff > 1e-04)
+                    lat_diff = np.abs(np.diff(v_data[:, 3])).max()  # LAT is col 3
+                    lon_diff = np.abs(np.diff(v_data[:, 2])).max()  # LON is col 2
+                    if lat_diff < 1e-04 and lon_diff < 1e-04:
+                        continue
+                    valid_vessels.append(v)
+
+                # S&F rejects if valid_vessels < total_vessels OR total_vessels <= 3
+                if len(valid_vessels) < total_vessels or total_vessels <= 3:
+                    j += self.shift
+                    continue
+
+                # Build sequence for valid vessels
+                self.max_peds_in_frame = max(self.max_peds_in_frame, len(valid_vessels))
+
+                curr_seq       = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
+                curr_seq_rel   = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
+                curr_loss_mask = np.zeros((len(valid_vessels), self.seq_len),    dtype=np.float32)
 
                 num_peds_considered = 0
                 _non_linear_ped     = []
 
-                for ped_id in peds_in_curr_seq:
-                    curr_ped_seq = curr_seq_data[curr_seq_data[:, 1] == ped_id]
-                    curr_ped_seq = np.around(curr_ped_seq, decimals=4)
+                for v in valid_vessels:
+                    v_data = frame[frame[:, 1] == v]
 
-                    pad_front = frame_to_idx[curr_ped_seq[0, 0]] - idx
-                    pad_end   = frame_to_idx[curr_ped_seq[-1, 0]] - idx + 1
+                    # Build full seq_len trajectory
+                    # Map frame_id → position in window
+                    traj = np.zeros((4, self.seq_len), dtype=np.float32)
+                    mask_v = np.zeros(self.seq_len, dtype=np.float32)
 
-                    if pad_end - pad_front != self.seq_len:
-                        continue
-                    if curr_ped_seq.shape[0] != self.seq_len:
-                        continue
+                    for row in v_data:
+                        t_idx = np.where(frame_timestamps == row[0])[0]
+                        if len(t_idx) == 0:
+                            continue
+                        t_idx = t_idx[0]
+                        traj[:, t_idx] = row[2:6]  # LON, LAT, SOG, Heading
+                        mask_v[t_idx]  = 1.0
 
-                    feat_seq     = np.transpose(curr_ped_seq[:, 2:]).astype(np.float32)  # (4, seq_len)
-                    rel_feat_seq = np.zeros_like(feat_seq)
-                    rel_feat_seq[:, 1:] = feat_seq[:, 1:] - feat_seq[:, :-1]
+                    rel_traj = np.zeros_like(traj)
+                    rel_traj[:, 1:] = traj[:, 1:] - traj[:, :-1]
 
-                    _idx = num_peds_considered
-                    curr_seq[_idx, :, pad_front:pad_end]     = feat_seq
-                    curr_seq_rel[_idx, :, pad_front:pad_end] = rel_feat_seq
-                    curr_loss_mask[_idx, pad_front:pad_end]  = 1.0
+                    curr_seq[num_peds_considered]       = traj
+                    curr_seq_rel[num_peds_considered]   = rel_traj
+                    curr_loss_mask[num_peds_considered] = mask_v
 
-                    _non_linear_ped.append(poly_fit(feat_seq, pred_len, threshold))
+                    _non_linear_ped.append(poly_fit(traj, self.pred_len, threshold))
                     num_peds_considered += 1
 
                 if num_peds_considered > min_ped:
@@ -488,6 +518,8 @@ class TrajectoryDataset(Dataset):
                     loss_mask_list.append(curr_loss_mask[:num_peds_considered])
                     seq_list.append(curr_seq[:num_peds_considered])
                     seq_list_rel.append(curr_seq_rel[:num_peds_considered])
+
+                j += self.shift
 
         if not seq_list:
             raise ValueError(
