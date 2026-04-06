@@ -232,8 +232,8 @@ class TrajectoryDataset(Dataset):
 
                     valid_vessels.append(v)
 
-                # S&F rejects if: valid < total OR total <= 3
-                if len(valid_vessels) < total_vessels or total_vessels <= 3:
+                # S&F rejects if there are 3 or fewer valid vessels
+                if len(valid_vessels) <= 3:
                     j += self.shift
                     continue
 
