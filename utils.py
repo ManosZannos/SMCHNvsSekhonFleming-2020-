@@ -4,15 +4,14 @@ utils.py
 Includes:
 1) Helper functions for AIS data loading
 
-2) TrajectoryDataset: aligned with Sekhon & Fleming 2020 data.py
+2) TrajectoryDataset: exact replication of Sekhon & Fleming 2020 data.py
    - Scene-based sliding window
    - shift = obs_len (no overlap)
    - feature_size = 2 (LAT, LON only)
-   - Random 80/10/10 split at sample level (matching S&F random_split)
-   - Filter: valid vessels (moving + present in all obs timestamps)
-   - Condition: len(valid_vessels) > 3
+   - STRICT S&F filter: ALL vessels must be valid (moving + present in ALL obs timestamps)
+   - Condition: total_vessels > 3 AND len(valid_vessels) == total_vessels
 
-3) load_data: random split function matching S&F data.py load_data()
+3) load_data: random 80/10/10 split at sample level (matching S&F data.py)
 """
 
 import os
@@ -72,26 +71,14 @@ def loc_pos(seq_):
 def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
     Builds node feature tensor V from RELATIVE features (velocities).
-
     S&F uses feature_size=2 (LAT, LON only).
-
-    Args:
-        seq_:    (N, F, seq_len) — absolute positions
-        seq_rel: (N, F, seq_len) — velocities
-        pos_enc: if True, prepend positional index
-
-    Returns:
-        V: torch.FloatTensor
     """
     assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
-
     V = seq_rel.permute(2, 0, 1).contiguous()  # (seq_len, N, F)
-
     if pos_enc:
         V_np = V.cpu().numpy()
         V_np = loc_pos(V_np)
         return torch.from_numpy(V_np).float()
-
     return V.float()
 
 
@@ -117,19 +104,21 @@ def get_features(ip, t):
 
 
 # ============================================================================
-# TRAJECTORY DATASET — aligned with S&F data.py
+# TRAJECTORY DATASET — Exact replication of S&F data.py
 # ============================================================================
 
 class TrajectoryDataset(Dataset):
     """
-    Scene-based sliding window dataset aligned with Sekhon & Fleming 2020.
+    Exact replication of Sekhon & Fleming 2020 data.py trajectory_dataset.
 
-    Key properties:
-    - feature_size=2: LAT, LON only (S&F paper)
-    - shift = obs_len: no overlap between windows
-    - Valid vessels: present in ALL obs timesteps AND moving (diff > 1e-04)
-    - Condition: len(valid_vessels) > 3 (>=4 valid moving vessels)
-    - Normalization already applied in preprocess_sf.py
+    Key properties (matching S&F):
+    - feature_size=2: LAT, LON only
+    - shift = obs_len: no overlap
+    - STRICT filter: ALL vessels in obs window must be:
+        1. Present in ALL obs_len timesteps
+        2. Moving (LAT diff > 1e-04 OR LON diff > 1e-04)
+      If ANY vessel fails → entire scene rejected (S&F behavior)
+    - Condition: total_vessels > 3
     """
 
     def __init__(
@@ -149,7 +138,7 @@ class TrajectoryDataset(Dataset):
         self.pred_len     = pred_len
         self.seq_len      = obs_len + pred_len
         self.feature_size = feature_size
-        self.shift        = obs_len  # S&F: shift = sequence_length
+        self.shift        = obs_len  # S&F: shift = sequence_length = obs_len
         self.max_peds_in_frame = 0
 
         all_files = sorted([
@@ -196,27 +185,45 @@ class TrajectoryDataset(Dataset):
                 obs_mask       = np.isin(frame[:, 0], obs_timestamps)
                 obs_frame      = frame[obs_mask]
 
-                # Valid vessels: present in ALL obs timesteps AND moving
+                total_vessels = np.unique(obs_frame[:, 1])
+
+                # S&F condition: total_vessels > 3
+                if len(total_vessels) <= 3:
+                    j += self.shift
+                    continue
+
+                # --- STRICT S&F _condition_vessels ---
+                # ALL vessels must be:
+                # 1. Present in ALL obs_len timesteps
+                # 2. Moving (not (LAT.diff.max < 1e-04) and not (LON.diff.max < 1e-04))
+                # If ANY vessel fails → reject entire scene
                 valid_vessels = []
-                for v in np.unique(obs_frame[:, 1]):
+                scene_valid = True
+
+                for v in total_vessels:
                     v_data = obs_frame[obs_frame[:, 1] == v]
 
+                    # Must be present in ALL obs timesteps
                     if len(v_data) != self.obs_len:
-                        continue
+                        scene_valid = False
+                        break
 
+                    # Must be moving (S&F: not (diff < 1e-04))
                     lat_diff = np.abs(np.diff(v_data[:, 3])).max()
                     lon_diff = np.abs(np.diff(v_data[:, 2])).max()
 
                     if lat_diff < 1e-04 and lon_diff < 1e-04:
-                        continue
+                        scene_valid = False
+                        break
 
                     valid_vessels.append(v)
 
-                # Require > 3 valid moving vessels
-                if len(valid_vessels) <= 3:
+                # Reject if any vessel failed (strict S&F behavior)
+                if not scene_valid or len(valid_vessels) < len(total_vessels):
                     j += self.shift
                     continue
 
+                # Build sequence tensors
                 self.max_peds_in_frame = max(self.max_peds_in_frame, len(valid_vessels))
 
                 curr_seq       = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
@@ -335,23 +342,15 @@ def load_data(data_dir, args):
     Replicates S&F data.py load_data():
     - Loads all processed CSVs from processed/ folder
     - Random 80/10/10 split at sample level
-    - Saves splits to train/val/test folders
-
-    Args:
-        data_dir: path to dataset/noaa_jan2017_sf/
-        args: namespace with obs_len, pred_len, feature_size, split_data
+    - Saves/loads splits as .pt files
     """
     processed_dir = os.path.join(data_dir, "processed")
-    train_dir     = os.path.join(data_dir, "train")
-    val_dir       = os.path.join(data_dir, "val")
-    test_dir      = os.path.join(data_dir, "test")
+    split_dir     = os.path.join(data_dir, "splits")
+    os.makedirs(split_dir, exist_ok=True)
 
-    for d in [train_dir, val_dir, test_dir]:
-        os.makedirs(d, exist_ok=True)
-
-    train_pt = os.path.join(train_dir, f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
-    val_pt   = os.path.join(val_dir,   f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
-    test_pt  = os.path.join(test_dir,  f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
+    train_pt = os.path.join(split_dir, f"{args.obs_len:02d}_{args.pred_len:02d}_train.pt")
+    val_pt   = os.path.join(split_dir, f"{args.obs_len:02d}_{args.pred_len:02d}_val.pt")
+    test_pt  = os.path.join(split_dir, f"{args.obs_len:02d}_{args.pred_len:02d}_test.pt")
 
     if getattr(args, 'split_data', False) or not os.path.exists(train_pt):
         print(f"Building dataset from {processed_dir}...")
@@ -370,8 +369,9 @@ def load_data(data_dir, args):
 
         print(f"\nTotal samples: {data_size}")
         print(f"Train: {train_size} | Val: {val_size} | Test: {test_size}")
+        print(f"Target: ~8676 total | ~6941 train | ~868 val | ~868 test")
 
-        # Random split (matching S&F)
+        # Random split (matching S&F random_split)
         traindataset, validdataset, testdataset = random_split(
             data, [train_size, val_size, test_size]
         )
@@ -379,11 +379,10 @@ def load_data(data_dir, args):
         torch.save(traindataset, train_pt)
         torch.save(validdataset, val_pt)
         torch.save(testdataset,  test_pt)
-
-        print(f"✓ Saved splits to {data_dir}")
+        print(f"✓ Saved splits to {split_dir}")
 
     else:
-        print(f"Loading existing splits from {data_dir}...")
+        print(f"Loading existing splits from {split_dir}...")
         traindataset = torch.load(train_pt)
         validdataset = torch.load(val_pt)
         testdataset  = torch.load(test_pt)

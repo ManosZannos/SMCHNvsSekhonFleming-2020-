@@ -2,12 +2,13 @@
 preprocess_sf.py — Exact replication of Sekhon & Fleming 2020 preprocessing pipeline
 
 Replicates:
-  1. preprocess_data.py: resample to 1min, interpolate, fix heading 511
-  2. grid.py: geographic filter, SOG filter, ocean mask, grid splitting
+  1. preprocess_data.py: resample to 1min, interpolate, fix heading 511 — per day
+  2. grid.py: geographic filter, SOG filter, grid splitting — on FULL MONTH data
   3. data.py normalization: LAT/LON min-max to [0,1], SOG/22, Heading/360
 
-NO day-level split here — split is done at sample level in TrajectoryDataset
-(aligned with S&F data.py random_split).
+KEY FIX (Bug #4): Grid split is done on the FULL MONTH concatenated data,
+not per day. This matches S&F pipeline where preprocess_data.py outputs
+one file per zone, and grid.py processes that full file.
 
 Output: frame-format CSV files in dataset/noaa_jan2017_sf/processed/
 
@@ -15,11 +16,11 @@ Usage:
   python preprocess_sf.py
 """
 
-import shutil
 import os
 import re
 import glob
 import math
+import shutil
 import zipfile
 import warnings
 import numpy as np
@@ -68,7 +69,7 @@ def load_zip(zip_path):
 
 
 # ============================================================================
-# Step 1: preprocess_data.py replication
+# Step 1: preprocess_data.py replication (per day)
 # ============================================================================
 def preprocess_step1(df):
     """
@@ -113,7 +114,7 @@ def preprocess_step1(df):
 
 
 # ============================================================================
-# Step 2: grid.py replication
+# Step 2: grid.py replication (on FULL MONTH data)
 # ============================================================================
 def preprocess_step2(df):
     """
@@ -155,6 +156,7 @@ def preprocess_step2(df):
 def split_into_grids(df, grid_size=GRID_SIZE):
     """
     Replicates grid.py grid splitting — non-overlapping (step = grid_size).
+    Operates on FULL MONTH data (not per day).
     Returns list of DataFrames, one per valid grid cell.
     """
     if df.empty:
@@ -169,9 +171,10 @@ def split_into_grids(df, grid_size=GRID_SIZE):
     l = min_lat
     while l < max_lat:
         l2 = min_lon
-        df_lat = df.loc[(df['LAT'] >= l) & (df['LAT'] <= (l + grid_size))]
+        # Use strict bounds to avoid overlapping (Bug #5 fix)
+        df_lat = df.loc[(df['LAT'] >= l) & (df['LAT'] < (l + grid_size))]
         while l2 < max_lon:
-            df_grid = df_lat.loc[(df_lat['LON'] >= l2) & (df_lat['LON'] <= (l2 + grid_size))]
+            df_grid = df_lat.loc[(df_lat['LON'] >= l2) & (df_lat['LON'] < (l2 + grid_size))]
 
             if not df_grid.empty:
                 groups = df_grid.groupby(['BaseDateTime'])
@@ -181,11 +184,12 @@ def split_into_grids(df, grid_size=GRID_SIZE):
                 timestamps = df_grid['BaseDateTime'].unique()
                 vessels    = df_grid['MMSI'].unique()
 
+                # S&F condition: >= 1000 timestamps AND > 3 vessels
                 if len(timestamps) >= MIN_TIMESTAMPS and len(vessels) > MIN_VESSELS:
                     grids.append(df_grid.copy())
 
-            l2 += GRID_SIZE  # non-overlapping
-        l += GRID_SIZE        # non-overlapping
+            l2 += GRID_SIZE
+        l += GRID_SIZE
 
     return grids
 
@@ -220,8 +224,11 @@ def normalize_sf(df):
     return df
 
 
-def to_frame_format(df):
-    """Convert to frame_id format for TrajectoryDataset."""
+def to_frame_format(df, grid_idx):
+    """
+    Convert to frame_id format for TrajectoryDataset.
+    frame_id = minutes from start of month (global timestamp).
+    """
     df = df.copy().sort_values('BaseDateTime')
     t0 = df['BaseDateTime'].min()
     df['frame_id'] = ((df['BaseDateTime'] - t0).dt.total_seconds() / 60.0).round().astype(int)
@@ -236,8 +243,8 @@ def main():
     raw_data_folder = "data/raw/2017_01"
     dataset_name    = "noaa_jan2017_sf"
     dataset_base    = os.path.join("dataset", dataset_name)
-    # All grids go to processed/ — split is done at sample level in TrajectoryDataset
     processed_dir   = os.path.join(dataset_base, "processed")
+
     # Auto-clean existing processed data
     if os.path.exists(processed_dir):
         print(f"Clearing existing processed data: {processed_dir}")
@@ -250,76 +257,104 @@ def main():
         return
 
     print(f"\n{'='*70}")
-    print(f"S&F PIPELINE — NOAA AIS January 2017")
+    print(f"S&F PIPELINE — NOAA AIS January 2017 (Full Month)")
     print(f"{'='*70}")
     print(f"Files: {len(zip_files)} days")
     print(f"Geographic bounds: LAT [{SF_LAT_MIN},{SF_LAT_MAX}], LON [{SF_LON_MIN},{SF_LON_MAX}]")
-    print(f"Grid size: {GRID_SIZE}° (non-overlapping)")
+    print(f"Grid size: {GRID_SIZE}° (non-overlapping, strict bounds)")
     print(f"Min timestamps: {MIN_TIMESTAMPS}")
-    print(f"Output: {processed_dir}/")
-    print(f"NOTE: train/val/test split done at sample level in TrajectoryDataset")
+    print(f"KEY: Grid split on FULL MONTH data (not per day)")
     print(f"{'='*70}\n")
 
-    total_grids = 0
+    # =========================================================================
+    # PASS 1: Process each day individually (Step 1 + Step 2), then concat
+    # This matches S&F: preprocess_data.py runs per day, output is one zone file
+    # =========================================================================
+    print("PASS 1: Processing each day (resample + filter)...")
+    all_days = []
 
     for zip_path in zip_files:
         filename = os.path.basename(zip_path)
         day_num  = get_day_from_filename(filename)
-        date_str = get_date_str_from_filename(filename)
-
-        if day_num is None or date_str is None:
+        if day_num is None:
             continue
 
-        print(f"Day {day_num:02d}: {filename}")
-
+        print(f"  Day {day_num:02d}: {filename}")
         try:
             df_raw = load_zip(zip_path)
-            print(f"  Loaded: {len(df_raw):,} rows, {df_raw['MMSI'].nunique()} vessels")
+            print(f"    Loaded: {len(df_raw):,} rows, {df_raw['MMSI'].nunique()} vessels")
 
-            # Step 1: resample/interpolate
+            # Step 1: resample/interpolate per day
             df = preprocess_step1(df_raw)
             if df.empty:
-                print(f"  SKIP: empty after Step 1")
+                print(f"    SKIP: empty after Step 1")
                 continue
-            print(f"  After Step 1: {len(df):,} rows")
+            print(f"    After Step 1: {len(df):,} rows")
 
             # Step 2: filtering
             df = preprocess_step2(df)
             if df.empty:
-                print(f"  SKIP: empty after Step 2")
+                print(f"    SKIP: empty after Step 2")
                 continue
-            print(f"  After Step 2: {len(df):,} rows, {df['MMSI'].nunique()} vessels")
+            print(f"    After Step 2: {len(df):,} rows, {df['MMSI'].nunique()} vessels")
 
-            # Step 2b: grid splitting
-            grids = split_into_grids(df)
-            print(f"  Grids: {len(grids)}")
-
-            for g_idx, grid_df in enumerate(grids):
-                # Step 3: normalize
-                grid_norm = normalize_sf(grid_df)
-                if grid_norm.empty:
-                    continue
-
-                # Convert to frame format
-                frames = to_frame_format(grid_norm)
-
-                # Save to processed/ (no split yet)
-                out_csv = os.path.join(processed_dir, f"day_{date_str}_grid{g_idx:02d}.csv")
-                frames.to_csv(out_csv, index=False)
-                total_grids += 1
-
-            print(f"  ✓ Saved {len(grids)} grids\n")
+            all_days.append(df)
 
         except Exception as e:
-            print(f"  ERROR: {e}\n")
+            print(f"    ERROR: {e}")
             continue
 
-    print(f"{'='*70}")
+    if not all_days:
+        print("ERROR: No data collected!")
+        return
+
+    # =========================================================================
+    # Concatenate all days into one monthly DataFrame
+    # This matches S&F: grid.py processes the full zone file
+    # =========================================================================
+    print(f"\nConcatenating {len(all_days)} days...")
+    df_month = pd.concat(all_days, ignore_index=True)
+    df_month.sort_values('BaseDateTime', inplace=True)
+    print(f"Total monthly data: {len(df_month):,} rows, {df_month['MMSI'].nunique()} vessels")
+    print(f"Timestamps: {df_month['BaseDateTime'].nunique():,}")
+
+    # =========================================================================
+    # PASS 2: Grid split on FULL MONTH data (Bug #4 fix)
+    # =========================================================================
+    print(f"\nPASS 2: Grid split on full month data...")
+    grids = split_into_grids(df_month)
+    print(f"Valid grids found: {len(grids)}")
+
+    # =========================================================================
+    # PASS 3: Normalize and save each grid
+    # =========================================================================
+    print(f"\nPASS 3: Normalizing and saving grids...")
+    total_saved = 0
+
+    for g_idx, grid_df in enumerate(grids):
+        # Step 3: normalize
+        grid_norm = normalize_sf(grid_df)
+        if grid_norm.empty:
+            continue
+
+        # Convert to frame format
+        frames = to_frame_format(grid_norm, g_idx)
+
+        # Save to processed/
+        out_csv = os.path.join(processed_dir, f"grid_{g_idx:03d}.csv")
+        frames.to_csv(out_csv, index=False)
+        total_saved += 1
+
+        vessels    = frames['vessel_id'].nunique()
+        timestamps = frames['frame_id'].nunique()
+        print(f"  grid_{g_idx:03d}: {vessels} vessels, {timestamps} frames → {out_csv}")
+
+    print(f"\n{'='*70}")
     print(f"PREPROCESSING COMPLETE!")
     print(f"{'='*70}")
     print(f"Dataset:     {dataset_name}")
     print(f"Location:    {processed_dir}/")
-    print(f"Total grids: {total_grids}")
+    print(f"Total grids: {total_saved}")
     print(f"\nNext: python train.py --dataset {dataset_name}")
     print(f"{'='*70}")
 
