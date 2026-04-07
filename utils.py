@@ -231,6 +231,14 @@ class TrajectoryDataset(Dataset):
             df = pd.read_csv(path)
             df.sort_values('frame_id', inplace=True)
 
+            # Pre-build pivot tables for fast vectorized window checks
+            pivot_lat = df.pivot_table(
+                index='frame_id', columns='vessel_id', values='LAT', aggfunc='first'
+            )
+            pivot_lon = df.pivot_table(
+                index='frame_id', columns='vessel_id', values='LON', aggfunc='first'
+            )
+
             timestamps = np.unique(df['frame_id'].values)
             n_frames   = len(timestamps)
 
@@ -240,47 +248,49 @@ class TrajectoryDataset(Dataset):
 
                 frame_timestamps = timestamps[j:j + self.seq_len]
 
+                # _condition_time: no gap > 1 min
                 diff_ts = np.diff(frame_timestamps).astype('float')
                 if np.amax(diff_ts) > 1:
                     _dbg_time += 1
                     j += self.shift
                     continue
 
-                mask_window = np.isin(df['frame_id'].values, frame_timestamps)
-                frame_df    = df[mask_window]
-
                 obs_timestamps = frame_timestamps[:self.obs_len]
-                obs_df = frame_df[np.isin(frame_df['frame_id'].values, obs_timestamps)]
 
-                total_vessels = obs_df['vessel_id'].unique()
-                n_total       = len(total_vessels)
+                # Vectorized _condition_vessels via pivot tables
+                obs_lat = pivot_lat.reindex(obs_timestamps)  # (obs_len, n_vessels)
+                obs_lon = pivot_lon.reindex(obs_timestamps)
+
+                # Present vessels: no NaN in any obs timestep
+                present_mask    = obs_lat.notna().all(axis=0)
+                present_vessels = obs_lat.columns[present_mask].tolist()
+                n_total         = len(present_vessels)
 
                 if n_total <= 3:
                     _dbg_few += 1
                     j += self.shift
                     continue
 
-                valid_vessels = []
-                for v in total_vessels:
-                    v_obs = obs_df[obs_df['vessel_id'] == v]
+                # Movement check: max|diff| >= 1e-04 in BOTH LAT and LON
+                lat_vals = obs_lat[present_vessels].values  # (obs_len, n_present)
+                lon_vals = obs_lon[present_vessels].values
 
-                    if len(v_obs) != self.obs_len:
-                        continue
+                lat_diff = np.abs(np.diff(lat_vals, axis=0)).max(axis=0)
+                lon_diff = np.abs(np.diff(lon_vals, axis=0)).max(axis=0)
 
-                    lat_static = abs(v_obs['LAT'].diff()).max() < 1e-04
-                    lon_static = abs(v_obs['LON'].diff()).max() < 1e-04
+                moving   = (lat_diff >= 1e-04) & (lon_diff >= 1e-04)
+                valid_vessels = [v for v, m in zip(present_vessels, moving) if m]
 
-                    # S&F: not lat_static AND not lon_static
-                    if lat_static or lon_static:
-                        continue
-
-                    valid_vessels.append(v)
-
-                # S&F line 76: len(valid) < total → reject (ALL must be valid)
+                # S&F: ALL vessels must be valid
                 if len(valid_vessels) < n_total:
                     _dbg_invalid += 1
                     j += self.shift
                     continue
+
+                # Fetch actual rows only for accepted windows
+                mask_window = np.isin(df['frame_id'].values, frame_timestamps)
+                frame_df    = df[mask_window]
+                obs_df      = frame_df[np.isin(frame_df['frame_id'].values, obs_timestamps)]
 
                 # ── get_sequence ──────────────────────────────────────────────
                 self.max_peds_in_frame = max(self.max_peds_in_frame, n_total)
