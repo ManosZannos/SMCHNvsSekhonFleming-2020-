@@ -329,8 +329,19 @@ def main():
 
     # =========================================================================
     # PASS 1 — preprocess_data.py: resample each day, no filtering
+    #
+    # NOTE: S&F raw CSVs are pre-filtered per zone before preprocess_data.py.
+    # Our raw data covers the entire US coast (218M rows/month). We apply a
+    # loose geographic pre-filter (wider than grid bounds) BEFORE resampling
+    # to reduce memory and runtime — equivalent to S&F zone-split input files.
+    # Pre-filter: LAT [31,34], LON [-119,-116] — wider than grid [32,33]x[-118,-117]
     # =========================================================================
+    PRE_LAT_MIN, PRE_LAT_MAX = 31.0, 34.0
+    PRE_LON_MIN, PRE_LON_MAX = -119.0, -116.0
+
     print("PASS 1: Resampling each day (preprocess_data.py)...")
+    print(f"  Geographic pre-filter: LAT [{PRE_LAT_MIN},{PRE_LAT_MAX}], "
+          f"LON [{PRE_LON_MIN},{PRE_LON_MAX}] (zone-equivalent, wider than grid)\n")
     all_days = []
 
     for zip_path in zip_files:
@@ -340,11 +351,22 @@ def main():
             continue
         try:
             df_raw = load_zip(zip_path)
+
+            # Pre-filter: reduces ~7M rows/day to manageable size before resample
+            df_raw = df_raw.loc[
+                (df_raw['LAT'] >= PRE_LAT_MIN) & (df_raw['LAT'] <= PRE_LAT_MAX) &
+                (df_raw['LON'] >= PRE_LON_MIN) & (df_raw['LON'] <= PRE_LON_MAX)
+            ]
+            if df_raw.empty:
+                print(f"  Day {day_num:02d}: empty after pre-filter, skip")
+                continue
+
             df_day = preprocess_step1_day(df_raw)
             if df_day.empty:
                 print(f"  Day {day_num:02d}: empty after resample, skip")
                 continue
-            print(f"  Day {day_num:02d}: {len(df_raw):,} raw → {len(df_day):,} resampled rows")
+            print(f"  Day {day_num:02d}: {len(df_raw):,} pre-filtered → "
+                  f"{len(df_day):,} resampled rows")
             all_days.append(df_day)
         except Exception as e:
             print(f"  Day {day_num:02d}: ERROR — {e}")
