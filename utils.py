@@ -219,6 +219,14 @@ class TrajectoryDataset(Dataset):
         loss_mask_list      = []
         non_linear_ped_list = []
 
+        # Debug counters
+        _dbg_total   = 0
+        _dbg_time    = 0
+        _dbg_few     = 0
+        _dbg_invalid = 0
+        _dbg_minped  = 0
+        _dbg_ok      = 0
+
         for path in all_files:
             df = pd.read_csv(path)
             df.sort_values('frame_id', inplace=True)
@@ -228,43 +236,34 @@ class TrajectoryDataset(Dataset):
 
             j = 0
             while not (j + self.seq_len) > n_frames:
+                _dbg_total += 1
 
                 frame_timestamps = timestamps[j:j + self.seq_len]
 
-                # ── _condition_time ───────────────────────────────────────────
-                # S&F: np.amax(np.diff(timestamps).astype('float')) / 6e+10 > 1
-                # = max gap > 1 minute (timestamps are datetime64, diff in ns)
-                # Our frame_ids are integers (minutes): diff > 1 ↔ gap > 1 min
                 diff_ts = np.diff(frame_timestamps).astype('float')
                 if np.amax(diff_ts) > 1:
+                    _dbg_time += 1
                     j += self.shift
                     continue
 
-                # All rows in this window
                 mask_window = np.isin(df['frame_id'].values, frame_timestamps)
                 frame_df    = df[mask_window]
 
-                # ── _condition_vessels ────────────────────────────────────────
-                # S&F line 70-71: trim to OBS timestamps only before checking
                 obs_timestamps = frame_timestamps[:self.obs_len]
                 obs_df = frame_df[np.isin(frame_df['frame_id'].values, obs_timestamps)]
 
                 total_vessels = obs_df['vessel_id'].unique()
                 n_total       = len(total_vessels)
 
-                # S&F line 76: total_vessels <= 3 → reject
                 if n_total <= 3:
+                    _dbg_few += 1
                     j += self.shift
                     continue
 
-                # S&F lines 73-75:
-                # valid_vessels = [v if not lat_static AND not lon_static
-                #                     AND len(v_data) == sequence_length]
                 valid_vessels = []
                 for v in total_vessels:
                     v_obs = obs_df[obs_df['vessel_id'] == v]
 
-                    # Must be present in ALL obs_len timesteps
                     if len(v_obs) != self.obs_len:
                         continue
 
@@ -279,6 +278,7 @@ class TrajectoryDataset(Dataset):
 
                 # S&F line 76: len(valid) < total → reject (ALL must be valid)
                 if len(valid_vessels) < n_total:
+                    _dbg_invalid += 1
                     j += self.shift
                     continue
 
@@ -324,11 +324,14 @@ class TrajectoryDataset(Dataset):
                     )
 
                 if n_total > min_ped:
+                    _dbg_ok += 1
                     non_linear_ped_list += _non_linear_ped
                     num_peds_in_seq.append(n_total)
                     loss_mask_list.append(curr_loss_mask)
                     seq_list.append(curr_seq)
                     seq_list_rel.append(curr_seq_rel)
+                else:
+                    _dbg_minped += 1
 
                 j += self.shift
 
@@ -338,6 +341,12 @@ class TrajectoryDataset(Dataset):
                 f"Check preprocessing and obs_len={obs_len}/pred_len={pred_len}."
             )
 
+        print(f"\n  Windows checked:      {_dbg_total}")
+        print(f"  Rejected (time gap):  {_dbg_time}")
+        print(f"  Rejected (<=3 vessels): {_dbg_few}")
+        print(f"  Rejected (invalid vessels): {_dbg_invalid}")
+        print(f"  Rejected (min_ped):   {_dbg_minped}")
+        print(f"  Accepted:             {_dbg_ok}")
         print(f"\nTotal sequences: {len(seq_list)}")
         self.num_seq = len(seq_list)
 
