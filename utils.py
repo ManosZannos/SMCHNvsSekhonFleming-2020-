@@ -301,7 +301,7 @@ class TrajectoryDataset(Dataset):
                 curr_loss_mask = np.zeros((n_total, self.seq_len),    dtype=np.float32)
                 _non_linear_ped = []
 
-                for vi, v in enumerate(total_vessels):
+                for vi, v in enumerate(present_vessels):
                     v_data = frame_df[frame_df['vessel_id'] == v]
 
                     # Build (seq_len, 4): [LON, LAT, SOG, Heading]
