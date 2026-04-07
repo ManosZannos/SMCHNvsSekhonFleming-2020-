@@ -1,21 +1,25 @@
 """
-utils.py
+utils.py — Aligned with Sekhon & Fleming 2020 data.py + geographic_utils.py
 
-Includes:
-1) Helper functions for AIS data loading
-
-2) TrajectoryDataset: exact replication of Sekhon & Fleming 2020 data.py
-   - Scene-based sliding window
-   - shift = obs_len (no overlap)
-   - feature_size = 2 (LAT, LON only)
-   - STRICT S&F filter: ALL vessels must be valid (moving + present in ALL obs timestamps)
-   - Condition: total_vessels > 3 AND len(valid_vessels) == total_vessels
-
-3) load_data: random 80/10/10 split at sample level (matching S&F data.py)
+Exact replications from S&F:
+  - obs_len=8, pred_len=12  (S&F main.py defaults: sequence_length=8, prediction_length=12)
+  - shift = obs_len (= sequence_length in S&F)
+  - _condition_time: max gap <= 1 min across all consecutive timestamps
+  - _condition_vessels:
+      * checked on OBS timestamps only (first obs_len timestamps)
+      * ALL vessels must be present in all obs steps (len == obs_len)
+      * ALL vessels must move: not lat_static AND not lon_static
+        (static = max(abs(diff)) < 1e-04)
+      * if ANY vessel fails → reject entire scene
+      * total_vessels > 3
+  - get_sequence: shape (N, obs+pred, 4), fillarr for missing pred steps
+  - Normalization bounds: geographic_utils.py ACTIVE lines [32,35]x[-120,-117]
+  - split: random 80/10/10 at sample level (S&F load_data)
 """
 
 import os
 import math
+import random
 import zipfile
 
 import torch
@@ -27,11 +31,43 @@ from tqdm import tqdm
 
 
 # ============================================================================
-# AIS / NOAA PREPROCESSING HELPERS
+# SEED — exact replication of S&F utils.py seed_everything(seed=100)
+# Called at import time to match S&F reproducibility
 # ============================================================================
 
-def load_noaa_csv(csv_or_zip_path: str, inner_csv_name: str | None = None, nrows: int | None = None) -> pd.DataFrame:
-    """Load NOAA AIS daily CSV from either a .csv or a .zip path."""
+def seed_everything(seed=100):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything()
+
+
+# ============================================================================
+# geographic_utils.py constants — ACTIVE lines
+# min_lat, max_lat, min_lon, max_lon = 32, 35, -120, -117 → radians
+# Must match preprocess_sf.py normalization bounds exactly
+# ============================================================================
+NORM_LAT_MIN_DEG = 32.0
+NORM_LAT_MAX_DEG = 35.0
+NORM_LON_MIN_DEG = -120.0
+NORM_LON_MAX_DEG = -117.0
+
+MIN_LAT = (math.pi / 180) * NORM_LAT_MIN_DEG
+MAX_LAT = (math.pi / 180) * NORM_LAT_MAX_DEG
+MIN_LON = (math.pi / 180) * NORM_LON_MIN_DEG
+MAX_LON = (math.pi / 180) * NORM_LON_MAX_DEG
+
+
+# ============================================================================
+# AIS LOADING HELPER
+# ============================================================================
+
+def load_noaa_csv(csv_or_zip_path: str, inner_csv_name: str | None = None,
+                  nrows: int | None = None) -> pd.DataFrame:
     if csv_or_zip_path.lower().endswith(".zip"):
         with zipfile.ZipFile(csv_or_zip_path) as z:
             if inner_csv_name is None:
@@ -56,11 +92,7 @@ def anorm(p1, p2):
 
 
 def loc_pos(seq_):
-    """
-    Adds a positional index as an extra feature.
-    Input:  seq_ shape (seq_len, N, F)
-    Output: shape (seq_len, N, F+1)
-    """
+    """Prepend positional index. Input (seq_len, N, F) → (seq_len, N, F+1)."""
     seq_len   = seq_.shape[0]
     num_nodes = seq_.shape[1]
     pos_seq   = np.arange(1, seq_len + 1)[:, np.newaxis, np.newaxis]
@@ -70,11 +102,16 @@ def loc_pos(seq_):
 
 def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
-    Builds node feature tensor V from RELATIVE features (velocities).
-    S&F uses feature_size=2 (LAT, LON only).
+    Build node feature tensor V from relative features.
+    Args:
+        seq_:    (N, F, seq_len) absolute
+        seq_rel: (N, F, seq_len) relative
+        pos_enc: prepend positional index if True
+    Returns:
+        V: FloatTensor (seq_len, N, F) or (seq_len, N, F+1)
     """
-    assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
-    V = seq_rel.permute(2, 0, 1).contiguous()  # (seq_len, N, F)
+    assert seq_rel.dim() == 3, f"Expected (N, F, T), got {seq_rel.shape}"
+    V = seq_rel.permute(2, 0, 1).contiguous()
     if pos_enc:
         V_np = V.cpu().numpy()
         V_np = loc_pos(V_np)
@@ -83,10 +120,7 @@ def seq_to_graph(seq_, seq_rel, pos_enc=False):
 
 
 def poly_fit(traj, traj_len, threshold):
-    """
-    Determines whether a trajectory is non-linear.
-    Input: traj shape (F, traj_len), uses first 2 channels.
-    """
+    """Non-linearity check. traj: (F, traj_len), uses first 2 channels."""
     traj2 = traj[:2, :]
     t     = np.linspace(0, traj_len - 1, traj_len)
     res_x = np.polyfit(t, traj2[0, -traj_len:], 2, full=True)[1]
@@ -95,50 +129,80 @@ def poly_fit(traj, traj_len, threshold):
 
 
 def get_features(ip, t):
-    """Compute distance, bearing, heading matrices. ip: (N, F, T)"""
-    N = ip.shape[0]
-    distance_matrix = torch.zeros(ip.shape[2], N, N)
-    bearing_matrix  = torch.zeros(ip.shape[2], N, N)
-    heading_matrix  = torch.zeros(ip.shape[2], N, N)
+    """Distance, bearing, heading matrices. ip: (N, seq_len, F)"""
+    N       = ip.shape[0]
+    seq_len = ip.shape[1]
+    distance_matrix = torch.zeros(seq_len, N, N)
+    bearing_matrix  = torch.zeros(seq_len, N, N)
+    heading_matrix  = torch.zeros(seq_len, N, N)
     return distance_matrix, bearing_matrix, heading_matrix
 
 
 # ============================================================================
-# TRAJECTORY DATASET — Exact replication of S&F data.py
+# FILLARR — exact replication of S&F data.py fillarr()
+# Forward-fill then backward-fill zero values in trajectory array
+# ============================================================================
+
+def fillarr(arr):
+    """
+    S&F data.py fillarr(): forward-fill then backward-fill zeros.
+    arr: (seq_len, n_features) numpy array.
+    """
+    for i in range(arr.shape[1]):
+        idx = np.arange(arr.shape[0])
+        idx[arr[:, i] == 0] = 0
+        np.maximum.accumulate(idx, axis=0, out=idx)
+        arr[:, i] = arr[idx, i]
+        if (arr[:, i] == 0).any():
+            idx[arr[:, i] == 0] = 0
+            np.minimum.accumulate(idx[::-1], axis=0)[::-1]
+            arr[:, i] = arr[idx, i]
+    return arr
+
+
+# ============================================================================
+# TRAJECTORY DATASET — exact replication of S&F data.py trajectory_dataset
 # ============================================================================
 
 class TrajectoryDataset(Dataset):
     """
-    Exact replication of Sekhon & Fleming 2020 data.py trajectory_dataset.
+    Exact replication of S&F data.py trajectory_dataset.
 
-    Key properties (matching S&F):
-    - feature_size=2: LAT, LON only
-    - shift = obs_len: no overlap
-    - STRICT filter: ALL vessels in obs window must be:
-        1. Present in ALL obs_len timesteps
-        2. Moving (LAT diff > 1e-04 OR LON diff > 1e-04)
-      If ANY vessel fails → entire scene rejected (S&F behavior)
-    - Condition: total_vessels > 3
+    Default obs_len=8, pred_len=12 matches S&F main.py:
+      --sequence_length 8 --prediction_length 12
+
+    Matched behaviours:
+      - shift = obs_len (S&F: self.shift = self.sequence_length)
+      - _condition_time: max gap across consecutive timestamps <= 1 min
+      - _condition_vessels:
+          * frame trimmed to OBS timestamps only
+          * total_vessels = all vessels in obs window
+          * valid = present in ALL obs_len steps
+                    AND not lat_static AND not lon_static
+                    (static: max|diff| < 1e-04)
+          * reject if ANY vessel invalid OR total_vessels <= 3
+      - get_sequence: (N, obs+pred, 4), fillarr fills missing pred-window zeros
+      - Normalization already applied in preprocess_sf.py
     """
 
     def __init__(
         self,
         data_dir,
-        obs_len=5,
-        pred_len=5,
+        obs_len=8,          # S&F default: sequence_length=8
+        pred_len=12,        # S&F default: prediction_length=12
         skip=1,
         threshold=0.002,
         min_ped=1,
         delim=",",
-        feature_size=2,
+        feature_size=2,     # S&F default: feature_size=2 (LAT, LON only)
     ):
         super(TrajectoryDataset, self).__init__()
 
         self.obs_len      = obs_len
         self.pred_len     = pred_len
-        self.seq_len      = obs_len + pred_len
+        self.seq_len      = obs_len + pred_len   # = 20
         self.feature_size = feature_size
-        self.shift        = obs_len  # S&F: shift = sequence_length = obs_len
+        self.shift        = obs_len              # S&F: self.shift = self.sequence_length
         self.max_peds_in_frame = 0
 
         all_files = sorted([
@@ -156,120 +220,122 @@ class TrajectoryDataset(Dataset):
         non_linear_ped_list = []
 
         for path in all_files:
-            data    = pd.read_csv(path)
-            data_np = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].values.astype(np.float32)
+            df = pd.read_csv(path)
+            df.sort_values('frame_id', inplace=True)
 
-            timestamps = np.unique(data_np[:, 0])
+            timestamps = np.unique(df['frame_id'].values)
             n_frames   = len(timestamps)
-
-            vessel_ids = np.unique(data_np[:, 1])
-            print(f"  {os.path.basename(path)}: {len(vessel_ids)} vessels, {n_frames} frames")
 
             j = 0
             while not (j + self.seq_len) > n_frames:
 
                 frame_timestamps = timestamps[j:j + self.seq_len]
 
-                # S&F _condition_time: consecutive timestamps (max 1 min gap)
-                diffs = np.diff(frame_timestamps)
-                if np.any(diffs > 1):
+                # ── _condition_time ───────────────────────────────────────────
+                # S&F: np.amax(np.diff(timestamps).astype('float')) / 6e+10 > 1
+                # = max gap > 1 minute (timestamps are datetime64, diff in ns)
+                # Our frame_ids are integers (minutes): diff > 1 ↔ gap > 1 min
+                diff_ts = np.diff(frame_timestamps).astype('float')
+                if np.amax(diff_ts) > 1:
                     j += self.shift
                     continue
 
                 # All rows in this window
-                mask  = np.isin(data_np[:, 0], frame_timestamps)
-                frame = data_np[mask]
+                mask_window = np.isin(df['frame_id'].values, frame_timestamps)
+                frame_df    = df[mask_window]
 
-                # Obs timestamps only
+                # ── _condition_vessels ────────────────────────────────────────
+                # S&F line 70-71: trim to OBS timestamps only before checking
                 obs_timestamps = frame_timestamps[:self.obs_len]
-                obs_mask       = np.isin(frame[:, 0], obs_timestamps)
-                obs_frame      = frame[obs_mask]
+                obs_df = frame_df[np.isin(frame_df['frame_id'].values, obs_timestamps)]
 
-                total_vessels = np.unique(obs_frame[:, 1])
+                total_vessels = obs_df['vessel_id'].unique()
+                n_total       = len(total_vessels)
 
-                # S&F condition: total_vessels > 3
-                if len(total_vessels) <= 3:
+                # S&F line 76: total_vessels <= 3 → reject
+                if n_total <= 3:
                     j += self.shift
                     continue
 
-                # --- STRICT S&F _condition_vessels ---
-                # ALL vessels must be:
-                # 1. Present in ALL obs_len timesteps
-                # 2. Moving (not (LAT.diff.max < 1e-04) and not (LON.diff.max < 1e-04))
-                # If ANY vessel fails → reject entire scene
+                # S&F lines 73-75:
+                # valid_vessels = [v if not lat_static AND not lon_static
+                #                     AND len(v_data) == sequence_length]
                 valid_vessels = []
-                scene_valid = True
-
                 for v in total_vessels:
-                    v_data = obs_frame[obs_frame[:, 1] == v]
+                    v_obs = obs_df[obs_df['vessel_id'] == v]
 
-                    # Must be present in ALL obs timesteps
-                    if len(v_data) != self.obs_len:
-                        scene_valid = False
-                        break
+                    # Must be present in ALL obs_len timesteps
+                    if len(v_obs) != self.obs_len:
+                        continue
 
-                    # Must be moving (S&F: not (diff < 1e-04))
-                    lat_diff = np.abs(np.diff(v_data[:, 3])).max()
-                    lon_diff = np.abs(np.diff(v_data[:, 2])).max()
+                    lat_static = abs(v_obs['LAT'].diff()).max() < 1e-04
+                    lon_static = abs(v_obs['LON'].diff()).max() < 1e-04
 
-                    if lat_diff < 1e-04 and lon_diff < 1e-04:
-                        scene_valid = False
-                        break
+                    # S&F: not lat_static AND not lon_static
+                    if lat_static or lon_static:
+                        continue
 
                     valid_vessels.append(v)
 
-                # Reject if any vessel failed (strict S&F behavior)
-                if not scene_valid or len(valid_vessels) < len(total_vessels):
+                # S&F line 76: len(valid) < total → reject (ALL must be valid)
+                if len(valid_vessels) < n_total:
                     j += self.shift
                     continue
 
-                # Build sequence tensors
-                self.max_peds_in_frame = max(self.max_peds_in_frame, len(valid_vessels))
+                # ── get_sequence ──────────────────────────────────────────────
+                self.max_peds_in_frame = max(self.max_peds_in_frame, n_total)
 
-                curr_seq       = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
-                curr_seq_rel   = np.zeros((len(valid_vessels), 4, self.seq_len), dtype=np.float32)
-                curr_loss_mask = np.zeros((len(valid_vessels), self.seq_len),    dtype=np.float32)
+                # Store as (N, 4, seq_len) for SMCHN compatibility
+                curr_seq       = np.zeros((n_total, 4, self.seq_len), dtype=np.float32)
+                curr_seq_rel   = np.zeros((n_total, 4, self.seq_len), dtype=np.float32)
+                curr_loss_mask = np.zeros((n_total, self.seq_len),    dtype=np.float32)
+                _non_linear_ped = []
 
-                num_peds_considered = 0
-                _non_linear_ped     = []
+                for vi, v in enumerate(total_vessels):
+                    v_data = frame_df[frame_df['vessel_id'] == v]
 
-                for v in valid_vessels:
-                    v_frame = frame[frame[:, 1] == v]
+                    # Build (seq_len, 4): [LON, LAT, SOG, Heading]
+                    traj   = np.zeros((self.seq_len, 4), dtype=np.float32)
+                    mask_v = np.zeros(self.seq_len,      dtype=np.float32)
 
-                    traj   = np.zeros((4, self.seq_len), dtype=np.float32)
-                    mask_v = np.zeros(self.seq_len, dtype=np.float32)
-
-                    for row in v_frame:
-                        t_idx = np.where(frame_timestamps == row[0])[0]
+                    for _, row in v_data.iterrows():
+                        t_idx = np.where(frame_timestamps == row['frame_id'])[0]
                         if len(t_idx) == 0:
                             continue
                         t_idx = t_idx[0]
-                        traj[:, t_idx] = row[2:6]
+                        traj[t_idx, :] = [row['LON'], row['LAT'],
+                                          row['SOG'], row['Heading']]
                         mask_v[t_idx]  = 1.0
 
-                    rel_traj = np.zeros_like(traj)
-                    rel_traj[:, 1:] = traj[:, 1:] - traj[:, :-1]
+                    # S&F fillarr: fill zeros for missing pred-window entries
+                    if (traj == 0).any():
+                        traj = fillarr(traj)
 
-                    curr_seq[num_peds_considered]       = traj
-                    curr_seq_rel[num_peds_considered]   = rel_traj
-                    curr_loss_mask[num_peds_considered] = mask_v
+                    traj_T          = traj.T                          # (4, seq_len)
+                    rel_traj        = np.zeros_like(traj_T)
+                    rel_traj[:, 1:] = traj_T[:, 1:] - traj_T[:, :-1]
 
-                    _non_linear_ped.append(poly_fit(traj, self.pred_len, threshold))
-                    num_peds_considered += 1
+                    curr_seq[vi]       = traj_T
+                    curr_seq_rel[vi]   = rel_traj
+                    curr_loss_mask[vi] = mask_v
 
-                if num_peds_considered > min_ped:
+                    _non_linear_ped.append(
+                        poly_fit(traj_T, self.pred_len, threshold)
+                    )
+
+                if n_total > min_ped:
                     non_linear_ped_list += _non_linear_ped
-                    num_peds_in_seq.append(num_peds_considered)
-                    loss_mask_list.append(curr_loss_mask[:num_peds_considered])
-                    seq_list.append(curr_seq[:num_peds_considered])
-                    seq_list_rel.append(curr_seq_rel[:num_peds_considered])
+                    num_peds_in_seq.append(n_total)
+                    loss_mask_list.append(curr_loss_mask)
+                    seq_list.append(curr_seq)
+                    seq_list_rel.append(curr_seq_rel)
 
                 j += self.shift
 
         if not seq_list:
             raise ValueError(
-                f"No valid sequences created from {data_dir}. "
-                "Check preprocessing and obs_len/pred_len."
+                f"No valid sequences found in {data_dir}. "
+                f"Check preprocessing and obs_len={obs_len}/pred_len={pred_len}."
             )
 
         print(f"\nTotal sequences: {len(seq_list)}")
@@ -280,15 +346,17 @@ class TrajectoryDataset(Dataset):
         loss_mask_arr  = np.concatenate(loss_mask_list, axis=0)
         non_linear_arr = np.asarray(non_linear_ped_list, dtype=np.float32)
 
-        self.obs_traj      = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
-        self.pred_traj     = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
-        self.obs_traj_rel  = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
-        self.pred_traj_rel = torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
-        self.loss_mask     = torch.from_numpy(loss_mask_arr).float()
+        self.obs_traj       = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
+        self.pred_traj      = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
+        self.obs_traj_rel   = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
+        self.pred_traj_rel  = torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
+        self.loss_mask      = torch.from_numpy(loss_mask_arr).float()
         self.non_linear_ped = torch.from_numpy(non_linear_arr).float()
 
         cum_start_idx      = [0] + np.cumsum(num_peds_in_seq).tolist()
-        self.seq_start_end = [(s, e) for s, e in zip(cum_start_idx, cum_start_idx[1:])]
+        self.seq_start_end = [
+            (s, e) for s, e in zip(cum_start_idx, cum_start_idx[1:])
+        ]
 
         self.v_obs  = []
         self.v_pred = []
@@ -334,32 +402,41 @@ class TrajectoryDataset(Dataset):
 
 
 # ============================================================================
-# LOAD DATA — Random 80/10/10 split at sample level (matching S&F data.py)
+# LOAD DATA — Random 80/10/10 split matching S&F data.py load_data()
 # ============================================================================
 
 def load_data(data_dir, args):
     """
     Replicates S&F data.py load_data():
-    - Loads all processed CSVs from processed/ folder
+    - Builds TrajectoryDataset from processed/ CSVs
     - Random 80/10/10 split at sample level
     - Saves/loads splits as .pt files
+
+    args expected attributes:
+      obs_len, pred_len, feature_size (default 2), split_data (default False)
     """
     processed_dir = os.path.join(data_dir, "processed")
-    split_dir     = os.path.join(data_dir, "splits")
-    os.makedirs(split_dir, exist_ok=True)
+    train_dir     = os.path.join(data_dir, "train")
+    val_dir       = os.path.join(data_dir, "val")
+    test_dir      = os.path.join(data_dir, "test")
 
-    train_pt = os.path.join(split_dir, f"{args.obs_len:02d}_{args.pred_len:02d}_train.pt")
-    val_pt   = os.path.join(split_dir, f"{args.obs_len:02d}_{args.pred_len:02d}_val.pt")
-    test_pt  = os.path.join(split_dir, f"{args.obs_len:02d}_{args.pred_len:02d}_test.pt")
+    for d in [train_dir, val_dir, test_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    train_pt = os.path.join(train_dir, f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
+    val_pt   = os.path.join(val_dir,   f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
+    test_pt  = os.path.join(test_dir,  f"{args.obs_len:02d}_{args.pred_len:02d}.pt")
 
     if getattr(args, 'split_data', False) or not os.path.exists(train_pt):
         print(f"Building dataset from {processed_dir}...")
+        print(f"obs_len={args.obs_len}, pred_len={args.pred_len} "
+              f"(S&F defaults: 8, 12)")
 
         data = TrajectoryDataset(
             processed_dir,
             obs_len=args.obs_len,
             pred_len=args.pred_len,
-            feature_size=getattr(args, 'feature_size', 2)
+            feature_size=getattr(args, 'feature_size', 2),
         )
 
         data_size  = len(data)
@@ -367,11 +444,10 @@ def load_data(data_dir, args):
         test_size  = val_size
         train_size = data_size - val_size - test_size
 
-        print(f"\nTotal samples: {data_size}")
+        print(f"Total samples: {data_size}")
         print(f"Train: {train_size} | Val: {val_size} | Test: {test_size}")
-        print(f"Target: ~8676 total | ~6941 train | ~868 val | ~868 test")
+        print(f"Target: ~8676")
 
-        # Random split (matching S&F random_split)
         traindataset, validdataset, testdataset = random_split(
             data, [train_size, val_size, test_size]
         )
@@ -379,10 +455,10 @@ def load_data(data_dir, args):
         torch.save(traindataset, train_pt)
         torch.save(validdataset, val_pt)
         torch.save(testdataset,  test_pt)
-        print(f"✓ Saved splits to {split_dir}")
+        print(f"Saved splits to {data_dir}")
 
     else:
-        print(f"Loading existing splits from {split_dir}...")
+        print(f"Loading existing splits from {data_dir}...")
         traindataset = torch.load(train_pt)
         validdataset = torch.load(val_pt)
         testdataset  = torch.load(test_pt)

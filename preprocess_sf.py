@@ -1,21 +1,25 @@
 """
 preprocess_sf.py — Exact replication of Sekhon & Fleming 2020 preprocessing pipeline
 
-Replicates:
-  1. preprocess_data.py: resample to 1min, interpolate, fix heading 511
-     — on FULL MONTH data per vessel (not per day)
-  2. grid.py: geographic filter, SOG filter, ocean mask, grid splitting
-     — on FULL MONTH data, overlapping grids with step=0.1° size=0.2°
-  3. data.py normalization: LAT/LON min-max to [0,1], SOG/22, Heading/360
+Exact pipeline order matching S&F:
+  1. preprocess_data.py logic: resample/interpolate PER DAY, NO filtering here
+     Output: one processed DataFrame per day, then concat → full month zone file
+  2. grid.py logic: ALL filtering on the full month zone file
+     - geographic bounds [32,33]x[-118,-117], SOG, ocean mask, anchored, crowd
+     - grid split with size=0.2°, step=0.1° (overlapping)
+  3. data.py normalize(): uses geographic_utils.py bounds [32,35]x[-120,-117]
+     LAT/LON radians → min-max [0,1] with WIDER bounds, SOG/22, Heading/360
 
-FIXES vs previous version:
-  Bug #1: Grid step corrected to 0.1° (overlapping) — was 0.2° (non-overlapping)
-          S&F grid.py: l2 += 0.1, l += 0.1 with grid_size=0.2
-  Bug #3: Step 1 (resample/interpolate) now runs on the FULL MONTH raw data
-          per vessel, not per day. This avoids splitting vessel trajectories
-          at day boundaries, matching S&F preprocess_data.py behaviour.
+KEY FIX vs previous versions:
+  - Normalization bounds come from geographic_utils.py (active lines):
+      min_lat, max_lat = 32, 35  (NOT 32, 33)
+      min_lon, max_lon = -120, -117  (NOT -118, -117)
+    This is what data.py normalize() and scale_values() use for ADE/FDE.
+  - Grid filtering still uses [32,33]x[-118,-117] (grid.py get_grids)
+  - Grid step = 0.1° (overlapping), grid size = 0.2°
+  - Step 1 (resample) PER DAY — bounded index, no hang
 
-Output: frame-format CSV files in dataset/noaa_jan2017_sf/processed/
+Output: dataset/noaa_jan2017_sf/processed/grid_NNN.csv
 
 Usage:
   python preprocess_sf.py
@@ -30,28 +34,37 @@ import zipfile
 import warnings
 import numpy as np
 import pandas as pd
-from global_land_mask import globe  # pyright: ignore[reportMissingImports]
+from global_land_mask import globe
 warnings.filterwarnings("ignore")
 
 # ============================================================================
-# S&F geographic constants (from geographic_utils.py and grid.py)
+# geographic_utils.py bounds — used for grid.py geographic filtering
 # ============================================================================
-SF_LAT_MIN = 32.0
-SF_LAT_MAX = 33.0
-SF_LON_MIN = -118.0
-SF_LON_MAX = -117.0
+GRID_LAT_MIN = 32.0
+GRID_LAT_MAX = 33.0
+GRID_LON_MIN = -118.0
+GRID_LON_MAX = -117.0
 
-# Min-max normalization bounds (radians, as in data.py)
-MIN_LAT = (math.pi / 180) * SF_LAT_MIN
-MAX_LAT = (math.pi / 180) * SF_LAT_MAX
-MIN_LON = (math.pi / 180) * SF_LON_MIN
-MAX_LON = (math.pi / 180) * SF_LON_MAX
+# ============================================================================
+# geographic_utils.py normalization bounds (ACTIVE lines in geographic_utils.py)
+# min_lat, max_lat, min_lon, max_lon = 32, 35, -120, -117  → converted to radians
+# This is what data.py normalize() uses for min-max scaling
+# ============================================================================
+NORM_LAT_MIN_DEG = 32.0
+NORM_LAT_MAX_DEG = 35.0
+NORM_LON_MIN_DEG = -120.0
+NORM_LON_MAX_DEG = -117.0
 
-# S&F grid.py parameters
-GRID_SIZE      = 0.2    # degrees — window size (unchanged)
-GRID_STEP      = 0.1    # degrees — step (Bug #1 fix: was 0.2, S&F uses 0.1)
-MIN_TIMESTAMPS = 1000   # minimum timestamps per grid cell
-MIN_VESSELS    = 3      # minimum vessels per grid cell (>3)
+MIN_LAT = (math.pi / 180) * NORM_LAT_MIN_DEG
+MAX_LAT = (math.pi / 180) * NORM_LAT_MAX_DEG
+MIN_LON = (math.pi / 180) * NORM_LON_MIN_DEG
+MAX_LON = (math.pi / 180) * NORM_LON_MAX_DEG
+
+# grid.py parameters
+GRID_SIZE      = 0.2    # degrees — window size
+GRID_STEP      = 0.1    # degrees — step (overlapping, matches grid.py l+=0.1)
+MIN_TIMESTAMPS = 1000   # minimum timestamps per valid grid cell
+MIN_VESSELS    = 3      # minimum vessels per valid grid cell (strictly >3)
 
 
 def get_day_from_filename(filename):
@@ -60,31 +73,35 @@ def get_day_from_filename(filename):
 
 
 def load_zip(zip_path):
+    """Load one daily AIS zip → DataFrame."""
     with zipfile.ZipFile(zip_path) as z:
         names = [n for n in z.namelist() if n.lower().endswith(".csv")]
         if not names:
             raise ValueError(f"No CSV in {zip_path}")
         with z.open(names[0]) as f:
-            return pd.read_csv(f,
-                               usecols=['MMSI', 'BaseDateTime', 'LAT', 'LON', 'SOG', 'Heading'],
-                               parse_dates=['BaseDateTime'])
+            return pd.read_csv(
+                f,
+                usecols=['MMSI', 'BaseDateTime', 'LAT', 'LON', 'SOG', 'Heading'],
+                parse_dates=['BaseDateTime']
+            )
 
 
 # ============================================================================
-# Step 1: preprocess_data.py replication
-# Bug #3 fix: runs on FULL MONTH raw data (not per day)
+# Step 1: preprocess_data.py replication — PER DAY, NO filtering
 # ============================================================================
-def preprocess_step1(df):
+def preprocess_step1_day(df):
     """
-    Replicates preprocess_data.py on the concatenated monthly raw data.
+    Exact replication of S&F preprocess_data.py for one daily file.
 
-    Per vessel (across full month):
-    - ceil to minute, remove duplicates
-    - resample 1min, interpolate (limit=5)
-    - fix heading 511 (invalid → ffill/bfill)
+    Per vessel:
+      - ceil BaseDateTime to minute
+      - drop duplicate timestamps (keep first)
+      - resample to 1min, interpolate(limit=5)
+      - dropna on LAT/LON  ← gaps >5min become NaN → trajectory splits naturally
+      - fix heading 511 (invalid → ffill/bfill)
 
-    Running this on the full month avoids splitting vessel trajectories
-    at day boundaries (Bug #3).
+    NO geographic or SOG filtering here — that is grid.py's job.
+    Running per day keeps resample index bounded to ~1440 minutes (no hang).
     """
     df = df.copy()
     df.sort_values(['BaseDateTime'], inplace=True)
@@ -93,21 +110,28 @@ def preprocess_step1(df):
     out_frames = []
     for vessel in vessels:
         vessel_data = df.loc[df['MMSI'] == vessel].copy()
+
         vessel_data['BaseDateTime'] = vessel_data['BaseDateTime'].dt.ceil('min')
         vessel_data = vessel_data.loc[~vessel_data['BaseDateTime'].duplicated(keep='first')]
-        vessel_data = vessel_data.set_index(['BaseDateTime']).resample('1min').interpolate(limit=5)
+
+        vessel_data = (vessel_data
+                       .set_index('BaseDateTime')
+                       .resample('1min')
+                       .interpolate(limit=5))
         vessel_data.reset_index('BaseDateTime', inplace=True)
         vessel_data = vessel_data.dropna(subset=['LAT', 'LON'])
 
         try:
-            vessel_data.set_index(['BaseDateTime'], inplace=True)
+            vessel_data.set_index('BaseDateTime', inplace=True)
             vessel_data['Heading'] = vessel_data['Heading'].astype('int32')
+            # S&F preprocess_data.py: _append is INSIDE the 'if not unique==1' block
+            # Vessels with constant heading (e.g. always 0 or always 511) are excluded
             if not len(vessel_data['Heading'].unique()) == 1:
                 if int(511) in vessel_data['Heading'].values:
                     vessel_data['Heading'].replace(to_replace=511, method='ffill', inplace=True)
                     vessel_data['Heading'].replace(to_replace=511, method='bfill', inplace=True)
-            vessel_data['MMSI'] = vessel
-            out_frames.append(vessel_data)
+                vessel_data['MMSI'] = vessel
+                out_frames.append(vessel_data)   # ← ONLY here, matching S&F
         except ValueError:
             continue
 
@@ -122,21 +146,24 @@ def preprocess_step1(df):
 
 
 # ============================================================================
-# Step 2: grid.py filtering (on FULL MONTH data)
+# Step 2: grid.py filtering — on FULL MONTH concat
 # ============================================================================
-def preprocess_step2(df):
+def preprocess_step2_grid(df):
     """
-    Replicates grid.py filtering (in order):
-    - LAT: [32, 33], LON: [-118, -117]
-    - SOG <= 22
-    - Ocean mask (remove land coordinates)
-    - Remove anchored vessels (max SOG <= 1 per vessel)
-    - Remove timestamps with <= 3 vessels
-    - Remove timestamps where max SOG <= 1
+    Exact replication of grid.py get_grids() filtering sequence.
+
+    Geographic filter uses GRID bounds [32,33]x[-118,-117] (grid.py).
+    Order matches grid.py exactly:
+      1. Geographic bounds
+      2. SOG <= 22
+      3. Ocean mask
+      4. Remove anchored vessels (max SOG <= 1 per vessel)
+      5. Remove timestamps with <= 3 vessels
+      6. Remove timestamps where max SOG <= 1
     """
     df = df.loc[
-        (df['LAT'] >= SF_LAT_MIN) & (df['LAT'] <= SF_LAT_MAX) &
-        (df['LON'] >= SF_LON_MIN) & (df['LON'] <= SF_LON_MAX)
+        (df['LAT'] >= GRID_LAT_MIN) & (df['LAT'] <= GRID_LAT_MAX) &
+        (df['LON'] >= GRID_LON_MIN) & (df['LON'] <= GRID_LON_MAX)
     ].copy()
     if df.empty:
         return df
@@ -166,23 +193,21 @@ def preprocess_step2(df):
 
 
 def ocean_mask(df):
-    """Replicates grid.py ocean_mask() — removes vessels on land."""
+    """Exact replication of grid.py ocean_mask()."""
     df = df.copy()
     df['is_ocean'] = globe.is_ocean(df['LAT'], df['LON'])
     df = df[df['is_ocean'] == True]
     return df.drop(['is_ocean'], axis=1)
 
 
-def split_into_grids(df, grid_size=GRID_SIZE, grid_step=GRID_STEP):
+def split_into_grids(df):
     """
-    Replicates grid.py grid splitting.
+    Exact replication of grid.py get_grids() grid splitting loop.
 
-    Bug #1 fix: step=0.1° (overlapping 50%), size=0.2°
-    S&F grid.py uses: l2 += 0.1, l += 0.1 with grid_size=0.2
-    Previously we used step=size=0.2 (non-overlapping) — this roughly
-    halved the number of valid grids.
-
-    Bounds: inclusive on both sides (matching S&F: >= l and <= l+grid_size).
+    size=0.2°, step=0.1° (overlapping) — matches grid.py:
+      l2 += 0.1 / l += 0.1 with grid_size=0.2
+    Bounds: inclusive on both sides (>= and <=) — matches grid.py.
+    Valid: len(timestamps) >= 1000 AND len(vessels) > 3.
     """
     if df.empty:
         return []
@@ -196,41 +221,52 @@ def split_into_grids(df, grid_size=GRID_SIZE, grid_step=GRID_STEP):
     l = min_lat
     while not l >= max_lat:
         l2 = min_lon
-        df_lat = df.loc[(df['LAT'] >= l) & (df['LAT'] <= (l + grid_size))]
+        df_lat = df.loc[(df['LAT'] >= l) & (df['LAT'] <= (l + GRID_SIZE))]
         while not l2 >= max_lon:
-            df_grid = df_lat.loc[(df_lat['LON'] >= l2) & (df_lat['LON'] <= (l2 + grid_size))]
+            df_grid = df_lat.loc[
+                (df_lat['LON'] >= l2) & (df_lat['LON'] <= (l2 + GRID_SIZE))
+            ]
 
             if not df_grid.empty:
                 groups = df_grid.groupby(['BaseDateTime'])
                 df_grid = groups.filter(lambda x: len(x['MMSI']) > 2)
 
             if not df_grid.empty:
-                timestamps = df_grid['BaseDateTime'].unique()
                 vessels    = df_grid['MMSI'].unique()
+                timestamps = df_grid['BaseDateTime'].unique()
 
                 if len(timestamps) >= MIN_TIMESTAMPS and len(vessels) > MIN_VESSELS:
+                    print(f"  Grid LAT [{l:.1f},{l+GRID_SIZE:.1f}] "
+                          f"LON [{l2:.1f},{l2+GRID_SIZE:.1f}]: "
+                          f"{len(vessels)} vessels, {len(timestamps)} timestamps")
                     grids.append(df_grid.copy())
 
-            l2 += grid_step   # Bug #1 fix: 0.1° step (was 0.2°)
-        l += grid_step         # Bug #1 fix: 0.1° step (was 0.2°)
+            l2 = round(l2 + GRID_STEP, 10)
+        l = round(l + GRID_STEP, 10)
 
     return grids
 
 
 # ============================================================================
-# Step 3: data.py normalization replication
+# Step 3: data.py normalize() — with geographic_utils.py WIDER bounds
 # ============================================================================
 def normalize_sf(df):
     """
-    Replicates data.py normalize():
-    - LAT/LON: convert to radians, then min-max normalize to [0,1]
-    - SOG: divide by 22
-    - Heading: divide by 360
+    Exact replication of data.py normalize() using geographic_utils.py bounds.
+
+    IMPORTANT: bounds are from geographic_utils.py ACTIVE lines:
+      min_lat, max_lat, min_lon, max_lon = 32, 35, -120, -117
+    NOT the commented-out Zone 11 bounds [32,33]x[-118,-117].
+
+    These wider bounds are also used by scale_values() in geographic_utils.py
+    when computing equirectangular_distance for ADE/FDE — so normalization
+    and error computation must use the same bounds.
     """
     df = df.copy()
     df['LAT'] = (math.pi / 180) * df['LAT']
     df['LON'] = (math.pi / 180) * df['LON']
 
+    # data.py normalize(): filter to normalization bounds
     df = df.loc[
         (df['LAT'] <= MAX_LAT) & (df['LAT'] >= MIN_LAT) &
         (df['LON'] <= MAX_LON) & (df['LON'] >= MIN_LON)
@@ -248,12 +284,15 @@ def normalize_sf(df):
 
 def to_frame_format(df):
     """
-    Convert to frame_id format for TrajectoryDataset.
-    frame_id = minutes elapsed from the first timestamp in this grid.
+    Convert BaseDateTime → integer frame_id (minutes from grid start).
+    Rename MMSI → vessel_id.
+    Output columns: frame_id, vessel_id, LON, LAT, SOG, Heading
     """
     df = df.copy().sort_values('BaseDateTime')
     t0 = df['BaseDateTime'].min()
-    df['frame_id'] = ((df['BaseDateTime'] - t0).dt.total_seconds() / 60.0).round().astype(int)
+    df['frame_id'] = (
+        (df['BaseDateTime'] - t0).dt.total_seconds() / 60.0
+    ).round().astype(int)
     df = df.rename(columns={'MMSI': 'vessel_id'})
     return df[['frame_id', 'vessel_id', 'LON', 'LAT', 'SOG', 'Heading']]
 
@@ -278,22 +317,21 @@ def main():
         return
 
     print(f"\n{'='*70}")
-    print(f"S&F PIPELINE — NOAA AIS January 2017 (Full Month)")
+    print(f"S&F PIPELINE — NOAA AIS January 2017")
     print(f"{'='*70}")
-    print(f"Files: {len(zip_files)} days")
-    print(f"Geographic bounds: LAT [{SF_LAT_MIN},{SF_LAT_MAX}], LON [{SF_LON_MIN},{SF_LON_MAX}]")
-    print(f"Grid size: {GRID_SIZE}°, step: {GRID_STEP}° (overlapping — Bug #1 fix)")
-    print(f"Min timestamps: {MIN_TIMESTAMPS}, Min vessels: >{MIN_VESSELS}")
-    print(f"Step 1 runs on FULL MONTH data per vessel (Bug #3 fix)")
+    print(f"Grid filter bounds:  LAT [{GRID_LAT_MIN},{GRID_LAT_MAX}], "
+          f"LON [{GRID_LON_MIN},{GRID_LON_MAX}]")
+    print(f"Normalization bounds: LAT [{NORM_LAT_MIN_DEG},{NORM_LAT_MAX_DEG}], "
+          f"LON [{NORM_LON_MIN_DEG},{NORM_LON_MAX_DEG}] (geographic_utils.py)")
+    print(f"Grid: size={GRID_SIZE}°, step={GRID_STEP}° (overlapping)")
+    print(f"Step 1: resample PER DAY | Step 2: filter on FULL MONTH concat")
     print(f"{'='*70}\n")
 
     # =========================================================================
-    # PASS 1: Load all raw days and concatenate
-    # Bug #3 fix: Step 1 (resample) runs on the full month per vessel,
-    # not per day. This prevents splitting trajectories at day boundaries.
+    # PASS 1 — preprocess_data.py: resample each day, no filtering
     # =========================================================================
-    print("PASS 1: Loading all raw daily files...")
-    all_raw = []
+    print("PASS 1: Resampling each day (preprocess_data.py)...")
+    all_days = []
 
     for zip_path in zip_files:
         filename = os.path.basename(zip_path)
@@ -302,77 +340,74 @@ def main():
             continue
         try:
             df_raw = load_zip(zip_path)
-            print(f"  Day {day_num:02d}: {len(df_raw):,} rows, {df_raw['MMSI'].nunique()} vessels")
-            all_raw.append(df_raw)
+            df_day = preprocess_step1_day(df_raw)
+            if df_day.empty:
+                print(f"  Day {day_num:02d}: empty after resample, skip")
+                continue
+            print(f"  Day {day_num:02d}: {len(df_raw):,} raw → {len(df_day):,} resampled rows")
+            all_days.append(df_day)
         except Exception as e:
             print(f"  Day {day_num:02d}: ERROR — {e}")
             continue
 
-    if not all_raw:
-        print("ERROR: No raw data loaded!")
+    if not all_days:
+        print("ERROR: No data after Step 1!")
         return
 
-    print(f"\nConcatenating {len(all_raw)} days of raw data...")
-    df_all_raw = pd.concat(all_raw, ignore_index=True)
-    df_all_raw.sort_values('BaseDateTime', inplace=True)
-    print(f"Total raw: {len(df_all_raw):,} rows, {df_all_raw['MMSI'].nunique()} vessels")
+    # Concat → full month (equivalent to S&F processed_data/11.csv)
+    print(f"\nConcatenating {len(all_days)} days...")
+    df_month = pd.concat(all_days, ignore_index=True)
+    df_month.sort_values('BaseDateTime', inplace=True)
+    print(f"Full month: {len(df_month):,} rows, "
+          f"{df_month['MMSI'].nunique()} vessels, "
+          f"{df_month['BaseDateTime'].nunique():,} unique timestamps")
 
     # =========================================================================
-    # Step 1: Resample/interpolate on full month per vessel
+    # PASS 2 — grid.py: filter + grid split on full month
     # =========================================================================
-    print(f"\nStep 1: Resampling full month per vessel (this may take a while)...")
-    df = preprocess_step1(df_all_raw)
-    if df.empty:
-        print("ERROR: empty after Step 1!")
+    print(f"\nPASS 2: Filtering (grid.py) on full month data...")
+    df_filtered = preprocess_step2_grid(df_month)
+    if df_filtered.empty:
+        print("ERROR: empty after filtering!")
         return
-    print(f"After Step 1: {len(df):,} rows, {df['MMSI'].nunique()} vessels")
+    print(f"After filtering: {len(df_filtered):,} rows, "
+          f"{df_filtered['MMSI'].nunique()} vessels, "
+          f"{df_filtered['BaseDateTime'].nunique():,} timestamps")
 
-    # =========================================================================
-    # Step 2: Filtering (geographic, SOG, ocean mask, crowd filter)
-    # =========================================================================
-    print(f"\nStep 2: Filtering...")
-    df = preprocess_step2(df)
-    if df.empty:
-        print("ERROR: empty after Step 2!")
+    print(f"\nGrid split (size={GRID_SIZE}°, step={GRID_STEP}°)...")
+    grids = split_into_grids(df_filtered)
+    print(f"Valid grids: {len(grids)}")
+
+    if not grids:
+        print("ERROR: No valid grids found!")
         return
-    print(f"After Step 2: {len(df):,} rows, {df['MMSI'].nunique()} vessels")
-    print(f"Unique timestamps: {df['BaseDateTime'].nunique():,}")
 
     # =========================================================================
-    # PASS 2: Grid split on full month data
-    # Bug #1 fix: step=0.1° overlapping grids (was 0.2° non-overlapping)
+    # PASS 3 — data.py normalize + save
     # =========================================================================
-    print(f"\nPASS 2: Grid split (step={GRID_STEP}°, size={GRID_SIZE}°)...")
-    grids = split_into_grids(df)
-    print(f"Valid grids found: {len(grids)}")
-
-    # =========================================================================
-    # PASS 3: Normalize and save each grid
-    # =========================================================================
-    print(f"\nPASS 3: Normalizing and saving grids...")
+    print(f"\nPASS 3: Normalizing (geographic_utils.py bounds) and saving...")
     total_saved = 0
 
     for g_idx, grid_df in enumerate(grids):
         grid_norm = normalize_sf(grid_df)
         if grid_norm.empty:
+            print(f"  grid_{g_idx:03d}: empty after normalization, skip")
             continue
 
-        frames = to_frame_format(grid_norm)
-
+        frames  = to_frame_format(grid_norm)
         out_csv = os.path.join(processed_dir, f"grid_{g_idx:03d}.csv")
         frames.to_csv(out_csv, index=False)
         total_saved += 1
 
-        vessels    = frames['vessel_id'].nunique()
-        timestamps = frames['frame_id'].nunique()
-        print(f"  grid_{g_idx:03d}: {vessels} vessels, {timestamps} frames → {out_csv}")
+        print(f"  grid_{g_idx:03d}: "
+              f"{frames['vessel_id'].nunique()} vessels, "
+              f"{frames['frame_id'].nunique()} frames → {out_csv}")
 
     print(f"\n{'='*70}")
-    print(f"PREPROCESSING COMPLETE!")
+    print(f"PREPROCESSING COMPLETE")
     print(f"{'='*70}")
-    print(f"Dataset:     {dataset_name}")
-    print(f"Location:    {processed_dir}/")
-    print(f"Total grids: {total_saved}")
+    print(f"Total grids saved: {total_saved}")
+    print(f"Output: {processed_dir}/")
     print(f"\nNext: python train.py --dataset {dataset_name}")
     print(f"{'='*70}")
 
