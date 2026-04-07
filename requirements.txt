@@ -3,3 +3,4 @@ pandas
 tqdm
 termcolor
 tensorboard
+global_land_mask
