@@ -28,7 +28,7 @@ parser.add_argument('--use_lrschd', action="store_true", default=False,
                     help='Use lr rate scheduler')
 parser.add_argument('--tag', default='SMCHN_8_12',
                     help='personal tag for the model')
-parser.add_argument('--feature_size', type=int, default=2,
+parser.add_argument('--feature_size', type=int, default=4,
                     help='Input feature size (2=LAT/LON only, S&F aligned)')
 parser.add_argument('--split_data', action="store_true", default=False,
                     help='Force re-split of dataset')
